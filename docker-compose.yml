@@ -10,6 +10,7 @@ services:
       - PLAYWRIGHT_MCP_URL=http://yk_playwright:8931
       - MODEL_FAST=${MODEL_FAST:-qwen2.5-coder:7b}
       - MODEL_SMART=${MODEL_SMART:-qwen2.5-coder:14b}
+      - MODEL_VISION=${MODEL_VISION:-gemma4:e4b}
       - PROXY_PORT=9999
     depends_on:
       yk_model_init:
@@ -43,6 +44,7 @@ services:
       - OLLAMA_HOST=http://yk_ollama:11434
       - MODEL_FAST=${MODEL_FAST:-qwen2.5-coder:7b}
       - MODEL_SMART=${MODEL_SMART:-qwen2.5-coder:14b}
+      - MODEL_VISION=${MODEL_VISION:-gemma4:e4b}
     volumes:
       - ./scripts/model-init.sh:/model-init.sh:ro
     entrypoint: ["sh", "/model-init.sh"]

@@ -12,11 +12,12 @@ app.use((req, res, next) => {
   next();
 });
 
-const OLLAMA     = process.env.OLLAMA_API_URL     || 'http://ollama:11434';
-const PLAYWRIGHT = process.env.PLAYWRIGHT_MCP_URL || 'http://yk_playwright:8931';
-const MODEL_FAST = process.env.MODEL_FAST          || 'qwen2.5-coder:7b';
-const MODEL_SMART= process.env.MODEL_SMART         || 'qwen2.5-coder:14b';
-const PORT       = Number(process.env.PROXY_PORT   || 9999);
+const OLLAMA      = process.env.OLLAMA_API_URL     || 'http://ollama:11434';
+const PLAYWRIGHT  = process.env.PLAYWRIGHT_MCP_URL || 'http://yk_playwright:8931';
+const MODEL_FAST  = process.env.MODEL_FAST         || 'qwen2.5-coder:7b';
+const MODEL_SMART = process.env.MODEL_SMART        || 'qwen2.5-coder:14b';
+const MODEL_VISION= process.env.MODEL_VISION       || 'gemma4:e4b';
+const PORT        = Number(process.env.PROXY_PORT  || 9999);
 
 // ─── Playwright MCP client ────────────────────────────────────────────────────
 
@@ -74,14 +75,62 @@ class PlaywrightClient {
     return (resp.result?.content || []).map(c => c.text || '').join('\n').trim();
   }
 
-  async navigate(url) {
-    await this.tool('browser_navigate', { url });
-    return this.snapshot();
-  }
+  async navigate(url) { await this.tool('browser_navigate', { url }); return this.snapshot(); }
 
   async snapshot() {
     const text = await this.tool('browser_snapshot', {});
     return text.length > 10000 ? text.slice(0, 10000) + '\n[... truncated ...]' : text;
+  }
+}
+
+// ─── Vision: image extraction and Gemma 4 preprocessing ──────────────────────
+
+function extractImages(messages) {
+  const images = [];
+  for (const m of messages) {
+    if (!Array.isArray(m.content)) continue;
+    for (const c of m.content) {
+      if (c.type === 'image' && c.source?.type === 'base64' && c.source.data) {
+        images.push(c.source.data);
+      }
+    }
+  }
+  return images;
+}
+
+function stripImages(messages) {
+  return messages.map(m => {
+    if (!Array.isArray(m.content) || !m.content.some(c => c.type === 'image')) return m;
+    const n = m.content.filter(c => c.type === 'image').length;
+    const texts = m.content.filter(c => c.type === 'text');
+    return { ...m, content: [...texts, { type: 'text', text: `[${n} image(s) — vision analysis injected above]` }] };
+  });
+}
+
+async function describeImages(images, userContext) {
+  if (!images.length) return null;
+  try {
+    const r = await fetch(`${OLLAMA}/api/chat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: MODEL_VISION,
+        messages: [{
+          role: 'user',
+          content: `You are a vision assistant helping a coding AI. Analyze this image and describe precisely:\n- Any visible code, error messages, stack traces\n- UI layouts, components, design elements\n- Diagrams, architecture, flowcharts\n- Terminal output, file structures\n- Any text visible in the image\n- What the user likely wants help with\n\nBe technical and thorough.${userContext ? `\n\nUser context: "${userContext}"` : ''}`,
+          images,
+        }],
+        stream: false,
+        options: { num_predict: 1500 },
+      }),
+      signal: AbortSignal.timeout(90000),
+    });
+    if (!r.ok) return null;
+    const data = await r.json();
+    return data.message?.content || null;
+  } catch (e) {
+    console.error('[vision]', e.message);
+    return null;
   }
 }
 
@@ -101,13 +150,9 @@ async function webSearch(query) {
     const count = Math.min(5, titles.length);
     if (!count) return `No results for: "${query}"`;
     const lines = [];
-    for (let i = 0; i < count; i++) {
-      lines.push(`${i + 1}. ${titles[i]}\n   ${urls[i] || ''}\n   ${snippets[i] || ''}`);
-    }
+    for (let i = 0; i < count; i++) lines.push(`${i + 1}. ${titles[i]}\n   ${urls[i] || ''}\n   ${snippets[i] || ''}`);
     return `Search results for "${query}":\n\n${lines.join('\n\n')}`;
-  } catch (e) {
-    return `Search error: ${e.message}`;
-  }
+  } catch (e) { return `Search error: ${e.message}`; }
 }
 
 // ─── Browser tools injected into every request ───────────────────────────────
@@ -120,15 +165,15 @@ const BROWSER_TOOLS = [
     function: {
       name: 'web_search',
       description: 'Search the web via DuckDuckGo. No API key needed. Use for docs, examples, answers, packages, anything online.',
-      parameters: { type: 'object', properties: { query: { type: 'string', description: 'Search query' } }, required: ['query'] },
+      parameters: { type: 'object', properties: { query: { type: 'string' } }, required: ['query'] },
     },
   },
   {
     type: 'function',
     function: {
       name: 'browser_navigate',
-      description: 'Open a URL in a real browser and return the page content as text. Handles JavaScript-rendered pages.',
-      parameters: { type: 'object', properties: { url: { type: 'string', description: 'Full URL including https://' } }, required: ['url'] },
+      description: 'Open a URL in a real browser and return the full page content. Handles JavaScript-rendered pages.',
+      parameters: { type: 'object', properties: { url: { type: 'string', description: 'Full URL with https://' } }, required: ['url'] },
     },
   },
   {
@@ -143,7 +188,7 @@ const BROWSER_TOOLS = [
 
 // ─── Structured planning system prompt ───────────────────────────────────────
 
-const PLANNING_SYSTEM = `You are a precise, methodical coding assistant with web research capabilities.
+const PLANNING_SYSTEM = `You are a precise, methodical coding assistant with web research and vision capabilities.
 
 For every non-trivial task follow this process:
 1. READ the full request carefully before any action
@@ -152,13 +197,12 @@ For every non-trivial task follow this process:
 4. VERIFY: after each tool call, confirm the result matches expectations
 5. ADJUST: if something fails, re-read the task, revise the plan, continue
 
-Available research tools (handled automatically, no API key, 100% local):
-- web_search(query): search the web via DuckDuckGo
+Available research tools (no API key, fully local):
+- web_search(query): search via DuckDuckGo
 - browser_navigate(url): open any URL in a real browser (handles JavaScript)
-- browser_snapshot(): read the current browser page content
+- browser_snapshot(): read current browser page content
 
 Code editing tools are provided by your environment (file read/write, bash, etc.).
-
 Respond in the same language as the user. Be concise in explanations, thorough in execution.`;
 
 // ─── Session store ────────────────────────────────────────────────────────────
@@ -185,14 +229,7 @@ function firstUserText(messages) {
 function getOrCreateSession(messages) {
   const key = simpleHash(firstUserText(messages));
   if (!sessions.has(key)) {
-    sessions.set(key, {
-      id: key,
-      firstMsg: firstUserText(messages).slice(0, 120),
-      startedAt: new Date().toISOString(),
-      lastActivity: new Date().toISOString(),
-      requests: 0, inputTokens: 0, outputTokens: 0, toolCalls: 0,
-      models: new Set(),
-    });
+    sessions.set(key, { id: key, firstMsg: firstUserText(messages).slice(0, 120), startedAt: new Date().toISOString(), lastActivity: new Date().toISOString(), requests: 0, inputTokens: 0, outputTokens: 0, toolCalls: 0, models: new Set() });
   }
   return sessions.get(key);
 }
@@ -207,9 +244,7 @@ function updateSession(session, { inputTokens, outputTokens, toolCalls, model })
 }
 
 function serializeSessions() {
-  return [...sessions.values()]
-    .map(s => ({ ...s, models: [...s.models] }))
-    .sort((a, b) => b.lastActivity.localeCompare(a.lastActivity));
+  return [...sessions.values()].map(s => ({ ...s, models: [...s.models] })).sort((a, b) => b.lastActivity.localeCompare(a.lastActivity));
 }
 
 // ─── Model routing ────────────────────────────────────────────────────────────
@@ -244,9 +279,7 @@ function toOllamaMessages(body) {
     if (msg.role === 'assistant') {
       if (Array.isArray(msg.content)) {
         const text = msg.content.filter(c => c.type === 'text').map(c => c.text).join('');
-        const toolCalls = msg.content
-          .filter(c => c.type === 'tool_use')
-          .map(c => ({ function: { name: c.name, arguments: c.input || {} } }));
+        const toolCalls = msg.content.filter(c => c.type === 'tool_use').map(c => ({ function: { name: c.name, arguments: c.input || {} } }));
         const entry = { role: 'assistant', content: text };
         if (toolCalls.length) entry.tool_calls = toolCalls;
         out.push(entry);
@@ -261,9 +294,7 @@ function toOllamaMessages(body) {
         const toolResults = msg.content.filter(c => c.type === 'tool_result');
         if (toolResults.length) {
           for (const tr of toolResults) {
-            const content = Array.isArray(tr.content)
-              ? tr.content.map(c => c.text || '').join('\n')
-              : (typeof tr.content === 'string' ? tr.content : '');
+            const content = Array.isArray(tr.content) ? tr.content.map(c => c.text || '').join('\n') : (typeof tr.content === 'string' ? tr.content : '');
             out.push({ role: 'tool', content });
           }
           continue;
@@ -297,18 +328,13 @@ function toolId() {
 
 // ─── SSE helpers ──────────────────────────────────────────────────────────────
 
-function sse(res, event, data) {
-  res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
-}
+function sse(res, event, data) { res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`); }
 
 function sseOpen(res, model) {
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('X-Accel-Buffering', 'no');
-  sse(res, 'message_start', {
-    type: 'message_start',
-    message: { id: `msg_${Date.now().toString(36)}`, type: 'message', role: 'assistant', content: [], model, stop_reason: null, usage: { input_tokens: 0, output_tokens: 0 } },
-  });
+  sse(res, 'message_start', { type: 'message_start', message: { id: `msg_${Date.now().toString(36)}`, type: 'message', role: 'assistant', content: [], model, stop_reason: null, usage: { input_tokens: 0, output_tokens: 0 } } });
   sse(res, 'ping', { type: 'ping' });
 }
 
@@ -339,20 +365,42 @@ function sseToolUse(res, calls, blockIndex, outputTokens) {
 // ─── Core agent loop ──────────────────────────────────────────────────────────
 
 async function runAgentLoop(body, res) {
-  const model   = selectModel(body);
-  const session = getOrCreateSession(body.messages || []);
   const stream  = body.stream !== false;
-  const pw      = new PlaywrightClient(PLAYWRIGHT);
+  const session = getOrCreateSession(body.messages || []);
 
-  // Merge Claude Code tools + browser tools
-  const claudeTools  = toOllamaTools(body.tools);
-  const allTools     = [...claudeTools, ...BROWSER_TOOLS];
-  const history      = toOllamaMessages(body);
+  // ── Step 1: Vision preprocessing ──────────────────────────
+  const rawImages = extractImages(body.messages || []);
+  let visionDescription = null;
+
+  if (rawImages.length) {
+    console.log(`[vision] processing ${rawImages.length} image(s) with ${MODEL_VISION}...`);
+    visionDescription = await describeImages(rawImages, firstUserText(body.messages));
+    if (visionDescription) console.log(`[vision] description ready (${visionDescription.length} chars)`);
+  }
+
+  // Strip raw images from messages before sending to code model
+  const cleanBody = visionDescription ? { ...body, messages: stripImages(body.messages) } : body;
+
+  // ── Step 2: Select code model and build history ────────────
+  const model       = selectModel(cleanBody);
+  const claudeTools = toOllamaTools(cleanBody.tools);
+  const allTools    = [...claudeTools, ...BROWSER_TOOLS];
+  const history     = toOllamaMessages(cleanBody);
+
+  // Inject vision description as context at the top of the conversation
+  if (visionDescription) {
+    // Insert after system message
+    history.splice(1, 0,
+      { role: 'user',      content: `[Vision Analysis by ${MODEL_VISION}]\n\n${visionDescription}` },
+      { role: 'assistant', content: 'I have analyzed the image(s) and will use this context to help you.' }
+    );
+  }
 
   let totalInput = 0, totalOutput = 0, totalToolCalls = 0;
 
   if (stream) sseOpen(res, model);
 
+  // ── Step 3: Code model agent loop ─────────────────────────
   for (let turn = 0; turn < 8; turn++) {
     let data;
     try {
@@ -366,15 +414,9 @@ async function runAgentLoop(body, res) {
       data = await r.json();
     } catch (e) {
       const errMsg = `\n\n❌ ${e.message}`;
-      if (stream) {
-        await sseText(res, errMsg, 0);
-        sse(res, 'message_delta', { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 0 } });
-        sse(res, 'message_stop', { type: 'message_stop' });
-        res.end();
-      } else {
-        res.json({ id: `msg_${Date.now()}`, type: 'message', role: 'assistant', content: [{ type: 'text', text: errMsg }], model, stop_reason: 'end_turn', usage: { input_tokens: 0, output_tokens: 0 } });
-      }
-      updateSession(session, { inputTokens: totalInput, outputTokens: totalOutput, toolCalls: totalToolCalls, model });
+      if (stream) { await sseText(res, errMsg, 0); sse(res, 'message_delta', { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 0 } }); sse(res, 'message_stop', { type: 'message_stop' }); res.end(); }
+      else res.json({ id: `msg_err`, type: 'message', role: 'assistant', content: [{ type: 'text', text: errMsg }], model, stop_reason: 'end_turn', usage: { input_tokens: 0, output_tokens: 0 } });
+      updateSession(session, { inputTokens: totalInput, outputTokens: totalOutput, toolCalls: totalToolCalls, model: `${MODEL_VISION}+${model}` });
       return;
     }
 
@@ -384,7 +426,7 @@ async function runAgentLoop(body, res) {
     const msg   = data.message || {};
     const calls = msg.tool_calls;
 
-    // ── No tool calls: final text response ──────────────────
+    // No tool calls: final text response
     if (!calls?.length) {
       const text = msg.content || '';
       if (stream) {
@@ -401,7 +443,7 @@ async function runAgentLoop(body, res) {
     const browserCalls = calls.filter(tc => BROWSER_TOOL_NAMES.has(tc.function.name));
     const claudeCalls  = calls.filter(tc => !BROWSER_TOOL_NAMES.has(tc.function.name));
 
-    // ── Only Claude Code tools: return to Claude Code ───────
+    // Only Claude Code tools: return to Claude Code to execute
     if (!browserCalls.length) {
       if (stream) {
         let idx = 0;
@@ -411,42 +453,39 @@ async function runAgentLoop(body, res) {
       } else {
         const content = [];
         if (msg.content) content.push({ type: 'text', text: msg.content });
-        for (const tc of claudeCalls) {
-          content.push({ type: 'tool_use', id: toolId(), name: tc.function.name, input: parseArgs(tc.function.arguments) });
-        }
+        for (const tc of claudeCalls) content.push({ type: 'tool_use', id: toolId(), name: tc.function.name, input: parseArgs(tc.function.arguments) });
         res.json({ id: `msg_${Date.now().toString(36)}`, type: 'message', role: 'assistant', content, model, stop_reason: 'tool_use', usage: { input_tokens: totalInput, output_tokens: totalOutput } });
       }
       break;
     }
 
-    // ── Browser tools: execute internally, loop back ─────────
+    // Browser tools: execute internally and loop back
     history.push({ role: 'assistant', content: msg.content || '', tool_calls: calls });
+    const pw = new PlaywrightClient(PLAYWRIGHT);
 
     for (const tc of calls) {
       const args = parseArgs(tc.function.arguments);
       let result = '';
       try {
-        if      (tc.function.name === 'web_search')        result = await webSearch(args.query);
-        else if (tc.function.name === 'browser_navigate')  result = await pw.navigate(args.url);
-        else if (tc.function.name === 'browser_snapshot')  result = await pw.snapshot();
+        if      (tc.function.name === 'web_search')       result = await webSearch(args.query);
+        else if (tc.function.name === 'browser_navigate') result = await pw.navigate(args.url);
+        else if (tc.function.name === 'browser_snapshot') result = await pw.snapshot();
         else result = `Tool ${tc.function.name} is handled by your environment.`;
-      } catch (e) {
-        result = `Error: ${e.message}`;
-      }
+      } catch (e) { result = `Error: ${e.message}`; }
       totalToolCalls++;
       history.push({ role: 'tool', content: result });
     }
   }
 
-  updateSession(session, { inputTokens: totalInput, outputTokens: totalOutput, toolCalls: totalToolCalls, model });
+  const usedModels = visionDescription ? `${MODEL_VISION}+${model}` : model;
+  updateSession(session, { inputTokens: totalInput, outputTokens: totalOutput, toolCalls: totalToolCalls, model: usedModels });
 }
 
 // ─── Routes ───────────────────────────────────────────────────────────────────
 
 app.post('/v1/messages', async (req, res) => {
-  try {
-    await runAgentLoop(req.body, res);
-  } catch (err) {
+  try { await runAgentLoop(req.body, res); }
+  catch (err) {
     console.error('[proxy]', err.message);
     if (!res.headersSent) res.status(500).json({ type: 'error', error: { type: 'api_error', message: err.message } });
   }
@@ -457,6 +496,7 @@ app.get('/v1/models', (_, res) => {
     { id: 'claude-sonnet-4-6', object: 'model', created: 0, owned_by: 'yk-copilot' },
     { id: MODEL_SMART,         object: 'model', created: 0, owned_by: 'ollama' },
     { id: MODEL_FAST,          object: 'model', created: 0, owned_by: 'ollama' },
+    { id: MODEL_VISION,        object: 'model', created: 0, owned_by: 'ollama' },
   ]});
 });
 
@@ -470,8 +510,9 @@ app.get('/api/stats', (_, res) => {
     totalInputTokens:  all.reduce((s, x) => s + x.inputTokens, 0),
     totalOutputTokens: all.reduce((s, x) => s + x.outputTokens, 0),
     totalToolCalls:    all.reduce((s, x) => s + x.toolCalls, 0),
-    modelFast:  MODEL_FAST,
-    modelSmart: MODEL_SMART,
+    modelFast:   MODEL_FAST,
+    modelSmart:  MODEL_SMART,
+    modelVision: MODEL_VISION,
   });
 });
 
@@ -484,5 +525,5 @@ app.use((req, res) => {
 });
 
 app.listen(PORT, '0.0.0.0', () =>
-  console.log(`[yk-copilot] port=${PORT} fast=${MODEL_FAST} smart=${MODEL_SMART} ollama=${OLLAMA} playwright=${PLAYWRIGHT}`)
+  console.log(`[yk-copilot] port=${PORT} fast=${MODEL_FAST} smart=${MODEL_SMART} vision=${MODEL_VISION} ollama=${OLLAMA}`)
 );
