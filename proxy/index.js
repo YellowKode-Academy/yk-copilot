@@ -134,25 +134,15 @@ async function describeImages(images, userContext) {
   }
 }
 
-// ─── Web search (DuckDuckGo, no API key) ─────────────────────────────────────
+// ─── Web search via Playwright (100% local, no external API) ─────────────────
 
-async function webSearch(query) {
+async function webSearch(query, pw) {
+  const url = `https://duckduckgo.com/?q=${encodeURIComponent(query)}&kl=wt-wt`;
   try {
-    const url = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}&kl=wt-wt`;
-    const r = await fetch(url, {
-      headers: { 'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120 Safari/537.36' },
-      signal: AbortSignal.timeout(15000),
-    });
-    const html = await r.text();
-    const titles   = [...html.matchAll(/class="result__a"[^>]*>([^<]+)<\/a>/g)].map(m => m[1].trim());
-    const snippets = [...html.matchAll(/class="result__snippet"[^>]*>([\s\S]*?)<\/a>/g)].map(m => m[1].replace(/<[^>]+>/g, '').trim());
-    const urls     = [...html.matchAll(/class="result__url"[^>]*>([^<]+)<\/a>/g)].map(m => m[1].trim());
-    const count = Math.min(5, titles.length);
-    if (!count) return `No results for: "${query}"`;
-    const lines = [];
-    for (let i = 0; i < count; i++) lines.push(`${i + 1}. ${titles[i]}\n   ${urls[i] || ''}\n   ${snippets[i] || ''}`);
-    return `Search results for "${query}":\n\n${lines.join('\n\n')}`;
-  } catch (e) { return `Search error: ${e.message}`; }
+    return await pw.navigate(url);
+  } catch (e) {
+    return `Search error: ${e.message}`;
+  }
 }
 
 // ─── Browser tools injected into every request ───────────────────────────────
@@ -164,7 +154,7 @@ const BROWSER_TOOLS = [
     type: 'function',
     function: {
       name: 'web_search',
-      description: 'Search the web via DuckDuckGo. No API key needed. Use for docs, examples, answers, packages, anything online.',
+      description: 'Search the web for documentation, examples, packages, answers. Opens a real browser locally, no external API.',
       parameters: { type: 'object', properties: { query: { type: 'string' } }, required: ['query'] },
     },
   },
@@ -197,10 +187,10 @@ For every non-trivial task follow this process:
 4. VERIFY: after each tool call, confirm the result matches expectations
 5. ADJUST: if something fails, re-read the task, revise the plan, continue
 
-Available research tools (no API key, fully local):
-- web_search(query): search via DuckDuckGo
-- browser_navigate(url): open any URL in a real browser (handles JavaScript)
-- browser_snapshot(): read current browser page content
+Available research tools (all 100% local via Playwright, no external APIs):
+- web_search(query): search the web by query, returns page content
+- browser_navigate(url): open any URL in a real browser (handles JavaScript-rendered pages)
+- browser_snapshot(): read the content of the currently open browser page
 
 Code editing tools are provided by your environment (file read/write, bash, etc.).
 Respond in the same language as the user. Be concise in explanations, thorough in execution.`;
@@ -467,7 +457,7 @@ async function runAgentLoop(body, res) {
       const args = parseArgs(tc.function.arguments);
       let result = '';
       try {
-        if      (tc.function.name === 'web_search')       result = await webSearch(args.query);
+        if      (tc.function.name === 'web_search')       result = await webSearch(args.query, pw);
         else if (tc.function.name === 'browser_navigate') result = await pw.navigate(args.url);
         else if (tc.function.name === 'browser_snapshot') result = await pw.snapshot();
         else result = `Tool ${tc.function.name} is handled by your environment.`;
