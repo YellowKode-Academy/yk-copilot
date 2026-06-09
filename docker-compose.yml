@@ -6,17 +6,17 @@ services:
     ports:
       - "${PROXY_PORT:-9999}:9999"
     environment:
-      - OLLAMA_API_URL=http://yk_ollama:11434
+      - OLLAMA_API_URL=${OLLAMA_API_URL:-http://yk_ollama:11434}
       - PLAYWRIGHT_MCP_URL=http://yk_playwright:8931
       - MODEL_FAST=${MODEL_FAST:-qwen2.5-coder:7b}
       - MODEL_SMART=${MODEL_SMART:-qwen2.5-coder:14b}
       - MODEL_VISION=${MODEL_VISION:-gemma4:e4b}
       - PROXY_PORT=9999
     depends_on:
-      yk_model_init:
-        condition: service_completed_successfully
       yk_playwright:
         condition: service_healthy
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     networks:
       - yk_copilot_net
 
@@ -24,6 +24,8 @@ services:
     image: ollama/ollama
     container_name: yk_ollama
     restart: unless-stopped
+    profiles:
+      - with-ollama
     volumes:
       - yk_ollama_data:/root/.ollama
     environment:
@@ -40,6 +42,8 @@ services:
   yk_model_init:
     image: ollama/ollama
     container_name: yk_model_init
+    profiles:
+      - with-ollama
     environment:
       - OLLAMA_HOST=http://yk_ollama:11434
       - MODEL_FAST=${MODEL_FAST:-qwen2.5-coder:7b}
