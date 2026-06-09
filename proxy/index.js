@@ -241,12 +241,14 @@ function serializeSessions() {
 
 function selectModel(body) {
   const msgs = body.messages || [];
+  const hasTools       = (body.tools?.length || 0) > 0;
   const hasToolResults = msgs.some(m => Array.isArray(m.content) && m.content.some(c => c.type === 'tool_result'));
   const totalLen = msgs.reduce((acc, m) => {
     const c = Array.isArray(m.content) ? m.content.map(x => x.text || '').join('') : (m.content || '');
     return acc + c.length;
   }, 0);
-  return (hasToolResults || totalLen > 6000 || msgs.length > 10) ? MODEL_SMART : MODEL_FAST;
+  // Always use the smart model when tools are involved — smaller models miss tool calls too often
+  return (hasTools || hasToolResults || totalLen > 6000 || msgs.length > 10) ? MODEL_SMART : MODEL_FAST;
 }
 
 // ─── Format translation ───────────────────────────────────────────────────────
@@ -305,6 +307,31 @@ function toOllamaTools(tools) {
     type: 'function',
     function: { name: t.name, description: t.description || '', parameters: t.input_schema || { type: 'object', properties: {} } },
   }));
+}
+
+// Fallback: some small models return tool calls as JSON text instead of tool_calls field.
+// Supports: {"name":"x","arguments":{}} and {"name":"x","parameters":{}}
+function tryParseTextToolCalls(text, knownNames) {
+  const t = (text || '').trim();
+  // Strip markdown code fences if present
+  const stripped = t.replace(/^```(?:json)?\n?/i, '').replace(/\n?```$/, '').trim();
+  try {
+    const obj = JSON.parse(stripped);
+    // Single call: {name, arguments|parameters|input}
+    const name = obj.name || obj.function;
+    const args = obj.arguments ?? obj.parameters ?? obj.input ?? {};
+    if (typeof name === 'string' && knownNames.has(name)) {
+      return [{ function: { name, arguments: args } }];
+    }
+    // Array of calls
+    if (Array.isArray(obj)) {
+      const parsed = obj
+        .filter(o => typeof (o.name || o.function) === 'string' && knownNames.has(o.name || o.function))
+        .map(o => ({ function: { name: o.name || o.function, arguments: o.arguments ?? o.parameters ?? o.input ?? {} } }));
+      if (parsed.length) return parsed;
+    }
+  } catch {}
+  return null;
 }
 
 function parseArgs(args) {
@@ -413,8 +440,14 @@ async function runAgentLoop(body, res) {
     totalInput  += data.prompt_eval_count || 0;
     totalOutput += data.eval_count || 0;
 
-    const msg   = data.message || {};
-    const calls = msg.tool_calls;
+    const msg = data.message || {};
+    // Some smaller models embed tool calls as JSON in content instead of tool_calls field.
+    // Detect and normalise so Claude Code always gets proper tool_use blocks.
+    let calls = msg.tool_calls;
+    if (!calls?.length && msg.content) {
+      const knownNames = new Set(allTools.map(t => t.function.name));
+      calls = tryParseTextToolCalls(msg.content, knownNames) || calls;
+    }
 
     // No tool calls: final text response
     if (!calls?.length) {
