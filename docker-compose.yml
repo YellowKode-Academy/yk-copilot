@@ -1,0 +1,54 @@
+services:
+  yk_copilot:
+    build: .
+    container_name: yk_copilot
+    restart: unless-stopped
+    ports:
+      - "${PROXY_PORT:-9999}:9999"
+    environment:
+      - OLLAMA_API_URL=http://yk_ollama:11434
+      - MODEL_FAST=${MODEL_FAST:-qwen2.5-coder:7b}
+      - MODEL_SMART=${MODEL_SMART:-qwen2.5-coder:14b}
+      - PROXY_PORT=9999
+    depends_on:
+      yk_model_init:
+        condition: service_completed_successfully
+    networks:
+      - yk_copilot_net
+
+  yk_ollama:
+    image: ollama/ollama
+    container_name: yk_ollama
+    restart: unless-stopped
+    volumes:
+      - yk_ollama_data:/root/.ollama
+    networks:
+      - yk_copilot_net
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:11434/api/tags"]
+      interval: 5s
+      timeout: 5s
+      retries: 15
+      start_period: 10s
+
+  yk_model_init:
+    image: ollama/ollama
+    container_name: yk_model_init
+    environment:
+      - OLLAMA_HOST=http://yk_ollama:11434
+      - MODEL_FAST=${MODEL_FAST:-qwen2.5-coder:7b}
+      - MODEL_SMART=${MODEL_SMART:-qwen2.5-coder:14b}
+    volumes:
+      - ./scripts/model-init.sh:/model-init.sh:ro
+    entrypoint: ["sh", "/model-init.sh"]
+    depends_on:
+      yk_ollama:
+        condition: service_healthy
+    networks:
+      - yk_copilot_net
+
+networks:
+  yk_copilot_net:
+
+volumes:
+  yk_ollama_data:
