@@ -395,8 +395,14 @@ async function runAgentLoop(body, res) {
     if (visionDescription) console.log(`[vision] description ready (${visionDescription.length} chars)`);
   }
 
-  // Strip raw images from messages before sending to code model
-  const cleanBody = visionDescription ? { ...body, messages: stripImages(body.messages) } : body;
+  // Always strip raw images from messages before sending to the code model
+  const cleanMessages = rawImages.length ? stripImages(body.messages) : body.messages;
+  const cleanBody = { ...body, messages: cleanMessages };
+
+  // If vision failed, inject a fallback note so the model knows images existed
+  const visionContext = rawImages.length && !visionDescription
+    ? `[Note: ${rawImages.length} image(s) were attached but the vision model could not process them.]`
+    : null;
 
   // ── Step 2: Select code model and build history ────────────
   const model       = selectModel(cleanBody);
@@ -404,12 +410,14 @@ async function runAgentLoop(body, res) {
   const allTools    = [...claudeTools, ...BROWSER_TOOLS];
   const history     = toOllamaMessages(cleanBody);
 
-  // Inject vision description as context at the top of the conversation
-  if (visionDescription) {
-    // Insert after system message
+  // Inject vision context (description or fallback note) after system message
+  const visionInject = visionDescription
+    ? `[Vision Analysis by ${MODEL_VISION}]\n\n${visionDescription}`
+    : visionContext;
+  if (visionInject) {
     history.splice(1, 0,
-      { role: 'user',      content: `[Vision Analysis by ${MODEL_VISION}]\n\n${visionDescription}` },
-      { role: 'assistant', content: 'I have analyzed the image(s) and will use this context to help you.' }
+      { role: 'user',      content: visionInject },
+      { role: 'assistant', content: visionDescription ? 'I have analyzed the image(s) and will use this context.' : 'Understood, I will proceed without the image content.' }
     );
   }
 

@@ -5,6 +5,25 @@
 //   node scripts/test.js --url http://localhost:9999
 //   node scripts/test.js --wait   (waits up to 120s for proxy to be ready)
 
+// Generate a solid-color PNG (no external deps) for vision testing
+function makeSolidPng(w, h, r, g, b) {
+  const crc32 = (() => {
+    const t = new Uint32Array(256);
+    for (let i = 0; i < 256; i++) { let c = i; for (let j = 0; j < 8; j++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1); t[i] = c; }
+    return (buf) => { let c = 0xFFFFFFFF; for (const byte of buf) c = t[(c ^ byte) & 0xFF] ^ (c >>> 8); return (c ^ 0xFFFFFFFF) >>> 0; };
+  })();
+  const adler = (buf) => { let a = 1, b2 = 0; for (const byte of buf) { a = (a + byte) % 65521; b2 = (b2 + a) % 65521; } return (b2 << 16) | a; };
+  const u32 = (n) => Buffer.from([(n >> 24) & 0xFF, (n >> 16) & 0xFF, (n >> 8) & 0xFF, n & 0xFF]);
+  const chunk = (type, data) => { const tb = Buffer.from(type, 'ascii'); return Buffer.concat([u32(data.length), tb, data, u32(crc32(Buffer.concat([tb, data])))]); };
+  const raw = Buffer.alloc(h * (1 + w * 3));
+  for (let y = 0; y < h; y++) { raw[y * (1 + w * 3)] = 0; for (let x = 0; x < w; x++) { const o = y * (1 + w * 3) + 1 + x * 3; raw[o] = r; raw[o+1] = g; raw[o+2] = b; } }
+  const zl = Buffer.alloc(2 + 5 + raw.length + 4);
+  zl[0] = 0x78; zl[1] = 0x01; zl[2] = 0x01;
+  zl[3] = raw.length & 0xFF; zl[4] = (raw.length >> 8) & 0xFF; zl[5] = (~raw.length) & 0xFF; zl[6] = (~raw.length >> 8) & 0xFF;
+  raw.copy(zl, 7); const ad = adler(raw); zl[7+raw.length]=(ad>>24)&0xFF; zl[8+raw.length]=(ad>>16)&0xFF; zl[9+raw.length]=(ad>>8)&0xFF; zl[10+raw.length]=ad&0xFF;
+  return Buffer.concat([Buffer.from([0x89,0x50,0x4E,0x47,0x0D,0x0A,0x1A,0x0A]), chunk('IHDR', Buffer.from([0,0,0,w,0,0,0,h,8,2,0,0,0])), chunk('IDAT', zl), chunk('IEND', Buffer.alloc(0))]).toString('base64');
+}
+
 const BASE = (() => {
   const i = process.argv.indexOf('--url');
   return i !== -1 ? process.argv[i + 1] : (process.env.YK_URL || 'http://localhost:9999');
@@ -192,8 +211,47 @@ async function run() {
     else         fail('Web search', 'No response from model');
   } catch (e) { fail('Web search via Playwright', e.message); }
 
-  // ── 9. Dashboard static ───────────────────────────────────────────────────
-  console.log(`\n${BOLD}9. Dashboard UI${RESET}`);
+  // ── 9. Vision pipeline (gemma4 → qwen) ───────────────────────────────────
+  console.log(`\n${BOLD}9. Vision pipeline (image → gemma4 → qwen2.5-coder)${RESET}`);
+  info('Generating 64x64 test image and sending through vision pipeline...');
+  try {
+    const imgB64 = makeSolidPng(64, 64, 0, 100, 200); // blue square
+    const msg = await sendMessage({
+      messages: [{
+        role: 'user',
+        content: [
+          { type: 'image', source: { type: 'base64', media_type: 'image/png', data: imgB64 } },
+          { type: 'text',  text: 'Describe what you see in this image in one sentence.' },
+        ],
+      }],
+    });
+    const text = msg.content?.find(c => c.type === 'text')?.text?.trim() || '';
+    const mentionsColor = /blue|color|solid|uniform|square|image/i.test(text);
+    if (mentionsColor) ok(`Vision pipeline → "${text.slice(0, 120)}${text.length > 120 ? '...' : ''}"`);
+    else if (text.length > 10) ok(`Vision pipeline responded (${text.length} chars) → "${text.slice(0, 80)}..."`);
+    else                       fail('Vision pipeline', 'Empty or no response');
+  } catch (e) { fail('Vision pipeline', e.message); }
+
+  // ── 10. Complex coding prompt ─────────────────────────────────────────────
+  console.log(`\n${BOLD}10. Complex coding prompt${RESET}`);
+  info('Asking for a real coding task (Python function with logic)...');
+  try {
+    const msg = await sendMessage({
+      messages: [{
+        role: 'user',
+        content: 'Write a Python function called `flatten` that takes a nested list of any depth and returns a flat list. Include a docstring and handle edge cases.',
+      }],
+    });
+    const text = msg.content?.find(c => c.type === 'text')?.text || '';
+    const hasCode   = text.includes('def flatten') || text.includes('def ');
+    const hasReturn = text.includes('return');
+    if (hasCode && hasReturn) ok(`Complex prompt → function generated (${text.length} chars, contains code)`);
+    else if (text.length > 50) fail('Complex coding prompt', `Response has no recognizable Python function:\n    "${text.slice(0, 120)}"`);
+    else                       fail('Complex coding prompt', 'Empty or too short response');
+  } catch (e) { fail('Complex coding prompt', e.message); }
+
+  // ── 11. Dashboard static ──────────────────────────────────────────────────
+  console.log(`\n${BOLD}11. Dashboard UI${RESET}`);
   try {
     const r = await fetch(`${BASE}/`, { signal: AbortSignal.timeout(5000) });
     if (r.ok) ok(`GET / → HTTP ${r.status} (dashboard HTML served)`);

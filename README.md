@@ -22,42 +22,43 @@ Claude Code CLI / VS Code Extension
 
 ## Getting started
 
-**Requirement:** [Docker Desktop](https://www.docker.com/products/docker-desktop/)
+**Requirements:** [Docker Desktop](https://www.docker.com/products/docker-desktop/)
 
 ```bash
 git clone https://github.com/YellowKode-Academy/yk-copilot
 cd yk-copilot
 cp .env.example .env
-```
-
-### Linux
-
-Ollama runs inside Docker. Models are pulled automatically on first run.
-
-```bash
-docker compose --profile with-ollama up -d
-```
-
-> First run downloads ~14 GB of models. Monitor with `docker compose logs -f yk_model_init`.
-
-### Mac / Windows (recommended)
-
-Install [Ollama](https://ollama.com) natively so it uses your GPU (Metal on Apple Silicon, CUDA on Windows).
-
-```bash
-# Pull models
-ollama pull qwen2.5-coder:7b
-ollama pull qwen2.5-coder:14b
-ollama pull gemma4:e4b
-
-# Uncomment in .env:
-# OLLAMA_API_URL=http://host.docker.internal:11434
-
-# Start only the proxy and browser
 docker compose up -d
 ```
 
-> Running Ollama natively on Mac/Windows gives full GPU acceleration. Inside Docker it would run CPU-only, which is very slow for the 14B model.
+On first run, models are downloaded automatically (~14 GB total). Monitor progress:
+
+```bash
+docker compose logs -f yk_model_init
+```
+
+Once `yk_model_init` finishes, `yk_copilot` starts automatically.
+
+### GPU acceleration (optional)
+
+By default Ollama runs inside Docker on CPU. For faster inference:
+
+**Mac / Windows** — install [Ollama](https://ollama.com) natively, pull models, then set in `.env`:
+```
+OLLAMA_API_URL=http://host.docker.internal:11434
+```
+Restart with `docker compose up -d` (only `yk_copilot` and `yk_playwright` start).
+
+**Linux** — add GPU passthrough to `yk_ollama` in `docker-compose.yml`:
+```yaml
+deploy:
+  resources:
+    reservations:
+      devices:
+        - driver: nvidia
+          count: all
+          capabilities: [gpu]
+```
 
 ## Smoke test
 
@@ -67,36 +68,7 @@ After `docker compose up`, verify everything works before activating:
 node scripts/test.js --wait
 ```
 
-The `--wait` flag polls until the proxy is ready (up to 120s), then runs 6 checks:
-
-```
-yk-copilot smoke test  http://localhost:9999
-
-1. Proxy
-  ✔ GET /health → { ok: true }
-
-2. Dashboard API
-  ✔ GET /api/stats → fast=qwen2.5-coder:7b  smart=qwen2.5-coder:14b  vision=gemma4:e4b
-  ✔ GET /api/sessions → OK
-
-3. Models endpoint
-  ✔ GET /v1/models → claude-sonnet-4-6, qwen2.5-coder:14b, qwen2.5-coder:7b, gemma4:e4b
-
-4. Message pipeline (non-streaming)
-  • Sending test message — first call may take 30-60s while Ollama loads the model...
-  ✔ POST /v1/messages → "PONG"
-
-5. Message pipeline (streaming SSE)
-  ✔ POST /v1/messages stream=true → "PONG"
-
-6. Dashboard UI
-  ✔ GET / → HTTP 200 (dashboard HTML served)
-
-──────────────────────────────────────────────────
-All 7 checks passed. Run yk-copilot on and start coding.
-```
-
-If any check fails, fix before running `yk-copilot on`.
+Runs 6 checks: proxy health, dashboard API, models endpoint, non-streaming and streaming message pipelines, and dashboard static serving. Exits 0 only if all pass.
 
 ## Quick switch: local ↔ cloud
 
@@ -126,6 +98,8 @@ Reload the VS Code window after switching (`Ctrl+Shift+P` > `Reload Window`).
 > or add `yk-copilot on` to your shell profile to always start in local mode.
 
 ## Configure Claude Code (manual)
+
+After containers are running, set these in your terminal:
 
 ```bash
 export ANTHROPIC_BASE_URL=http://localhost:9999
@@ -160,9 +134,9 @@ Edit `MODEL_FAST`, `MODEL_SMART`, `MODEL_VISION` in `.env` to use different Olla
 
 ```bash
 docker compose logs -f yk_copilot     # proxy logs
-docker compose logs -f yk_model_init  # model download progress (Linux)
+docker compose logs -f yk_model_init  # model download progress
 docker compose down                   # stop
-docker compose down -v                # stop and delete all data
+docker compose down -v                # stop and delete all data (including models)
 ```
 
 ---
