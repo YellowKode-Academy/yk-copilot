@@ -1,9 +1,13 @@
 # yk-switch.ps1 — toggle between local (yk-copilot) and Anthropic cloud
 #
-# Setup (add ONE of these lines to your PowerShell $PROFILE):
-#   . C:\full\path\to\yk-copilot\scripts\yk-switch.ps1
-#   # or with a custom port:
-#   $env:YK_PORT = "9999"; . C:\full\path\to\yk-copilot\scripts\yk-switch.ps1
+# Setup (add to your PowerShell $PROFILE):
+#   $env:YK_DIR = "C:\YellowKode\public\yk-copilot"
+#   . "$env:YK_DIR\scripts\yk-switch.ps1"
+#
+# Usage:
+#   yk-copilot on     starts Docker stack + sets env vars + updates VS Code
+#   yk-copilot off    stops stack + restores cloud mode
+#   yk-copilot status shows current mode
 
 function yk-copilot {
   param([string]$Mode = "status")
@@ -46,12 +50,14 @@ try {
       $env:ANTHROPIC_API_KEY  = "ollama"
       Update-VsCode "on"
       Write-Host "[yk] LOCAL  > Claude Code -> $Proxy (qwen2.5-coder + gemma4, 100% local)"
+      Write-Host "[yk] Reload VS Code: Ctrl+Shift+P > Reload Window"
     }
     "off" {
       Remove-Item Env:ANTHROPIC_BASE_URL -ErrorAction SilentlyContinue
       Remove-Item Env:ANTHROPIC_API_KEY  -ErrorAction SilentlyContinue
       Update-VsCode "off"
       Write-Host "[yk] CLOUD  > Claude Code -> api.anthropic.com"
+      Write-Host "[yk] Reload VS Code: Ctrl+Shift+P > Reload Window"
     }
     "status" {
       if ($env:ANTHROPIC_BASE_URL) {
