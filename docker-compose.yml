@@ -13,6 +13,8 @@ services:
       - MODEL_VISION=${MODEL_VISION:-gemma4:e4b}
       - PROXY_PORT=9999
     depends_on:
+      yk_model_init:
+        condition: service_completed_successfully
       yk_playwright:
         condition: service_healthy
     extra_hosts:
@@ -24,8 +26,6 @@ services:
     image: ollama/ollama
     container_name: yk_ollama
     restart: unless-stopped
-    profiles:
-      - with-ollama
     volumes:
       - yk_ollama_data:/root/.ollama
     environment:
@@ -42,8 +42,6 @@ services:
   yk_model_init:
     image: ollama/ollama
     container_name: yk_model_init
-    profiles:
-      - with-ollama
     environment:
       - OLLAMA_HOST=http://yk_ollama:11434
       - MODEL_FAST=${MODEL_FAST:-qwen2.5-coder:7b}
@@ -76,7 +74,7 @@ services:
     volumes:
       - playwright_output:/output
     healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:8931/"]
+      test: ["CMD", "curl", "-s", "--max-time", "3", "http://localhost:8931/mcp"]
       interval: 15s
       timeout: 5s
       retries: 8
