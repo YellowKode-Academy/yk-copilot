@@ -5,7 +5,7 @@
 #   # or with a custom port:
 #   $env:YK_PORT = "9999"; . C:\full\path\to\yk-copilot\scripts\yk-switch.ps1
 
-function yk {
+function yk-copilot {
   param([string]$Mode = "status")
 
   $Port  = if ($env:YK_PORT) { $env:YK_PORT } else { "9999" }
@@ -61,7 +61,7 @@ try {
       }
     }
     default {
-      Write-Host "Usage: yk on | yk off | yk status"
+      Write-Host "Usage: yk-copilot on | yk-copilot off | yk-copilot status"
     }
   }
 }

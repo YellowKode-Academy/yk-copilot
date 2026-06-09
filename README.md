@@ -61,7 +61,7 @@ docker compose up -d
 
 ## Quick switch: local ↔ cloud
 
-Install the `yk` command once and toggle instantly from any terminal.
+Install the `yk-copilot` command once and toggle instantly from any terminal.
 
 **Mac / Linux** — add to `~/.zshrc` or `~/.bashrc`:
 ```bash
@@ -75,16 +75,16 @@ source /full/path/to/yk-copilot/scripts/yk-switch.sh
 
 Then:
 ```
-yk on      # Claude Code → localhost:9999 (local LLM, free)
-yk off     # Claude Code → api.anthropic.com (back to cloud)
-yk status  # show current mode
+yk-copilot on      # Claude Code → localhost:9999 (local LLM, free)
+yk-copilot off     # Claude Code → api.anthropic.com (back to cloud)
+yk-copilot status  # show current mode
 ```
 
 Both commands also update VS Code `settings.json` automatically.
 Reload the VS Code window after switching (`Ctrl+Shift+P` > `Reload Window`).
 
-> CLI env vars are session-scoped. Open a new terminal and run `yk on` again,
-> or add `yk on` to your shell profile to always start in local mode.
+> CLI env vars are session-scoped. Open a new terminal and run `yk-copilot on` again,
+> or add `yk-copilot on` to your shell profile to always start in local mode.
 
 ## Configure Claude Code (manual)
 

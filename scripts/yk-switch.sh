@@ -6,7 +6,7 @@
 #   # or with a custom port:
 #   YK_PORT=9999 source /full/path/to/yk-copilot/scripts/yk-switch.sh
 
-yk() {
+yk-copilot() {
   local MODE="${1:-status}"
   local PORT="${YK_PORT:-9999}"
   local PROXY="http://localhost:${PORT}"
@@ -65,7 +65,7 @@ JSEOF
       fi
       ;;
     *)
-      echo "Usage: yk on | yk off | yk status"
+      echo "Usage: yk-copilot on | yk-copilot off | yk-copilot status"
       return 1
       ;;
   esac
