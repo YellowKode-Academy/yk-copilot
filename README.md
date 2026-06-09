@@ -59,6 +59,45 @@ docker compose up -d
 
 > Running Ollama natively on Mac/Windows gives full GPU acceleration. Inside Docker it would run CPU-only, which is very slow for the 14B model.
 
+## Smoke test
+
+After `docker compose up`, verify everything works before activating:
+
+```bash
+node scripts/test.js --wait
+```
+
+The `--wait` flag polls until the proxy is ready (up to 120s), then runs 6 checks:
+
+```
+yk-copilot smoke test  http://localhost:9999
+
+1. Proxy
+  ✔ GET /health → { ok: true }
+
+2. Dashboard API
+  ✔ GET /api/stats → fast=qwen2.5-coder:7b  smart=qwen2.5-coder:14b  vision=gemma4:e4b
+  ✔ GET /api/sessions → OK
+
+3. Models endpoint
+  ✔ GET /v1/models → claude-sonnet-4-6, qwen2.5-coder:14b, qwen2.5-coder:7b, gemma4:e4b
+
+4. Message pipeline (non-streaming)
+  • Sending test message — first call may take 30-60s while Ollama loads the model...
+  ✔ POST /v1/messages → "PONG"
+
+5. Message pipeline (streaming SSE)
+  ✔ POST /v1/messages stream=true → "PONG"
+
+6. Dashboard UI
+  ✔ GET / → HTTP 200 (dashboard HTML served)
+
+──────────────────────────────────────────────────
+All 7 checks passed. Run yk-copilot on and start coding.
+```
+
+If any check fails, fix before running `yk-copilot on`.
+
 ## Quick switch: local ↔ cloud
 
 Install the `yk-copilot` command once and toggle instantly from any terminal.
