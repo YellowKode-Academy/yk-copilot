@@ -59,9 +59,34 @@ docker compose up -d
 
 > Running Ollama natively on Mac/Windows gives full GPU acceleration. Inside Docker it would run CPU-only, which is very slow for the 14B model.
 
-## Configure Claude Code
+## Quick switch: local ↔ cloud
 
-After containers are running, set these in your terminal:
+Install the `yk` command once and toggle instantly from any terminal.
+
+**Mac / Linux** — add to `~/.zshrc` or `~/.bashrc`:
+```bash
+source /full/path/to/yk-copilot/scripts/yk-switch.sh
+```
+
+**Windows** — add to your PowerShell `$PROFILE`:
+```powershell
+. C:\full\path\to\yk-copilot\scripts\yk-switch.ps1
+```
+
+Then:
+```
+yk on      # Claude Code → localhost:9999 (local LLM, free)
+yk off     # Claude Code → api.anthropic.com (back to cloud)
+yk status  # show current mode
+```
+
+Both commands also update VS Code `settings.json` automatically.
+Reload the VS Code window after switching (`Ctrl+Shift+P` > `Reload Window`).
+
+> CLI env vars are session-scoped. Open a new terminal and run `yk on` again,
+> or add `yk on` to your shell profile to always start in local mode.
+
+## Configure Claude Code (manual)
 
 ```bash
 export ANTHROPIC_BASE_URL=http://localhost:9999
