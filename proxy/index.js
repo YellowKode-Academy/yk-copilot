@@ -1,6 +1,6 @@
 'use strict';
 const express = require('express');
-const path = require('path');
+const path    = require('path');
 
 const app = express();
 app.use(express.json({ limit: '50mb' }));
@@ -12,10 +12,154 @@ app.use((req, res, next) => {
   next();
 });
 
-const OLLAMA     = process.env.OLLAMA_API_URL || 'http://ollama:11434';
-const MODEL_FAST = process.env.MODEL_FAST     || 'qwen2.5-coder:7b';
-const MODEL_SMART= process.env.MODEL_SMART    || 'qwen2.5-coder:14b';
-const PORT       = Number(process.env.PROXY_PORT || 9999);
+const OLLAMA     = process.env.OLLAMA_API_URL     || 'http://ollama:11434';
+const PLAYWRIGHT = process.env.PLAYWRIGHT_MCP_URL || 'http://yk_playwright:8931';
+const MODEL_FAST = process.env.MODEL_FAST          || 'qwen2.5-coder:7b';
+const MODEL_SMART= process.env.MODEL_SMART         || 'qwen2.5-coder:14b';
+const PORT       = Number(process.env.PROXY_PORT   || 9999);
+
+// ─── Playwright MCP client ────────────────────────────────────────────────────
+
+class PlaywrightClient {
+  constructor(baseUrl) {
+    this.baseUrl = baseUrl;
+    this.sessionId = null;
+    this.reqId = 0;
+    this.initialized = false;
+  }
+
+  async _post(body) {
+    const headers = { 'Content-Type': 'application/json', 'Accept': 'application/json, text/event-stream' };
+    if (this.sessionId) headers['Mcp-Session-Id'] = this.sessionId;
+    const r = await fetch(`${this.baseUrl}/mcp`, {
+      method: 'POST', headers, body: JSON.stringify(body),
+      signal: AbortSignal.timeout(30000),
+    });
+    const sid = r.headers.get('Mcp-Session-Id');
+    if (sid) this.sessionId = sid;
+    const text = await r.text();
+    if (text.includes('\ndata:') || text.startsWith('data:')) {
+      for (const line of text.split('\n')) {
+        if (!line.startsWith('data:')) continue;
+        try {
+          const d = JSON.parse(line.slice(5).trim());
+          if (body.id !== undefined && d.id === body.id) return d;
+          if (body.id === undefined) return d;
+        } catch {}
+      }
+      return null;
+    }
+    try { return JSON.parse(text); } catch { return null; }
+  }
+
+  async init() {
+    if (this.initialized) return;
+    const id = ++this.reqId;
+    await this._post({ jsonrpc: '2.0', id, method: 'initialize',
+      params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'yk-copilot', version: '1.0.0' } } });
+    fetch(`${this.baseUrl}/mcp`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...(this.sessionId ? { 'Mcp-Session-Id': this.sessionId } : {}) },
+      body: JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized', params: {} }),
+    }).catch(() => {});
+    this.initialized = true;
+  }
+
+  async tool(name, args = {}) {
+    await this.init();
+    const id = ++this.reqId;
+    const resp = await this._post({ jsonrpc: '2.0', id, method: 'tools/call', params: { name, arguments: args } });
+    if (!resp) return '';
+    if (resp.error) throw new Error(resp.error.message || JSON.stringify(resp.error));
+    return (resp.result?.content || []).map(c => c.text || '').join('\n').trim();
+  }
+
+  async navigate(url) {
+    await this.tool('browser_navigate', { url });
+    return this.snapshot();
+  }
+
+  async snapshot() {
+    const text = await this.tool('browser_snapshot', {});
+    return text.length > 10000 ? text.slice(0, 10000) + '\n[... truncated ...]' : text;
+  }
+}
+
+// ─── Web search (DuckDuckGo, no API key) ─────────────────────────────────────
+
+async function webSearch(query) {
+  try {
+    const url = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}&kl=wt-wt`;
+    const r = await fetch(url, {
+      headers: { 'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120 Safari/537.36' },
+      signal: AbortSignal.timeout(15000),
+    });
+    const html = await r.text();
+    const titles   = [...html.matchAll(/class="result__a"[^>]*>([^<]+)<\/a>/g)].map(m => m[1].trim());
+    const snippets = [...html.matchAll(/class="result__snippet"[^>]*>([\s\S]*?)<\/a>/g)].map(m => m[1].replace(/<[^>]+>/g, '').trim());
+    const urls     = [...html.matchAll(/class="result__url"[^>]*>([^<]+)<\/a>/g)].map(m => m[1].trim());
+    const count = Math.min(5, titles.length);
+    if (!count) return `No results for: "${query}"`;
+    const lines = [];
+    for (let i = 0; i < count; i++) {
+      lines.push(`${i + 1}. ${titles[i]}\n   ${urls[i] || ''}\n   ${snippets[i] || ''}`);
+    }
+    return `Search results for "${query}":\n\n${lines.join('\n\n')}`;
+  } catch (e) {
+    return `Search error: ${e.message}`;
+  }
+}
+
+// ─── Browser tools injected into every request ───────────────────────────────
+
+const BROWSER_TOOL_NAMES = new Set(['web_search', 'browser_navigate', 'browser_snapshot']);
+
+const BROWSER_TOOLS = [
+  {
+    type: 'function',
+    function: {
+      name: 'web_search',
+      description: 'Search the web via DuckDuckGo. No API key needed. Use for docs, examples, answers, packages, anything online.',
+      parameters: { type: 'object', properties: { query: { type: 'string', description: 'Search query' } }, required: ['query'] },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'browser_navigate',
+      description: 'Open a URL in a real browser and return the page content as text. Handles JavaScript-rendered pages.',
+      parameters: { type: 'object', properties: { url: { type: 'string', description: 'Full URL including https://' } }, required: ['url'] },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'browser_snapshot',
+      description: 'Read the content of the currently open browser page.',
+      parameters: { type: 'object', properties: {} },
+    },
+  },
+];
+
+// ─── Structured planning system prompt ───────────────────────────────────────
+
+const PLANNING_SYSTEM = `You are a precise, methodical coding assistant with web research capabilities.
+
+For every non-trivial task follow this process:
+1. READ the full request carefully before any action
+2. PLAN: write a numbered list of steps before executing anything
+3. EXECUTE one step at a time, checking results before continuing
+4. VERIFY: after each tool call, confirm the result matches expectations
+5. ADJUST: if something fails, re-read the task, revise the plan, continue
+
+Available research tools (handled automatically, no API key, 100% local):
+- web_search(query): search the web via DuckDuckGo
+- browser_navigate(url): open any URL in a real browser (handles JavaScript)
+- browser_snapshot(): read the current browser page content
+
+Code editing tools are provided by your environment (file read/write, bash, etc.).
+
+Respond in the same language as the user. Be concise in explanations, thorough in execution.`;
 
 // ─── Session store ────────────────────────────────────────────────────────────
 
@@ -23,20 +167,17 @@ const sessions = new Map();
 
 function simpleHash(str) {
   let h = 0;
-  for (let i = 0; i < Math.min(str.length, 400); i++) {
-    h = (Math.imul(31, h) + str.charCodeAt(i)) | 0;
-  }
+  for (let i = 0; i < Math.min(str.length, 400); i++) h = (Math.imul(31, h) + str.charCodeAt(i)) | 0;
   return (h >>> 0).toString(36);
 }
 
 function firstUserText(messages) {
   for (const m of messages) {
     if (m.role !== 'user') continue;
-    if (typeof m.content === 'string') return m.content.slice(0, 300);
-    if (Array.isArray(m.content)) {
-      const t = m.content.filter(c => c.type === 'text').map(c => c.text).join(' ');
-      if (t) return t.slice(0, 300);
-    }
+    const c = Array.isArray(m.content)
+      ? m.content.filter(x => x.type === 'text').map(x => x.text).join(' ')
+      : (m.content || '');
+    if (c) return c.slice(0, 300);
   }
   return `anon_${Date.now()}`;
 }
@@ -49,10 +190,7 @@ function getOrCreateSession(messages) {
       firstMsg: firstUserText(messages).slice(0, 120),
       startedAt: new Date().toISOString(),
       lastActivity: new Date().toISOString(),
-      requests: 0,
-      inputTokens: 0,
-      outputTokens: 0,
-      toolCalls: 0,
+      requests: 0, inputTokens: 0, outputTokens: 0, toolCalls: 0,
       models: new Set(),
     });
   }
@@ -78,9 +216,7 @@ function serializeSessions() {
 
 function selectModel(body) {
   const msgs = body.messages || [];
-  const hasToolResults = msgs.some(m =>
-    Array.isArray(m.content) && m.content.some(c => c.type === 'tool_result')
-  );
+  const hasToolResults = msgs.some(m => Array.isArray(m.content) && m.content.some(c => c.type === 'tool_result'));
   const totalLen = msgs.reduce((acc, m) => {
     const c = Array.isArray(m.content) ? m.content.map(x => x.text || '').join('') : (m.content || '');
     return acc + c.length;
@@ -88,7 +224,7 @@ function selectModel(body) {
   return (hasToolResults || totalLen > 6000 || msgs.length > 10) ? MODEL_SMART : MODEL_FAST;
 }
 
-// ─── Format translation: Anthropic → Ollama ──────────────────────────────────
+// ─── Format translation ───────────────────────────────────────────────────────
 
 function extractSystem(body) {
   if (!body.system) return null;
@@ -99,19 +235,11 @@ function extractSystem(body) {
 
 function toOllamaMessages(body) {
   const out = [];
-  const sys = extractSystem(body);
-  if (sys) {
-    out.push({
-      role: 'system',
-      content: sys + '\n\nBefore each response, briefly plan your approach before acting.',
-    });
-  }
+  const envSystem = extractSystem(body);
+  out.push({ role: 'system', content: [PLANNING_SYSTEM, envSystem].filter(Boolean).join('\n\n') });
 
   for (const msg of (body.messages || [])) {
-    if (msg.role === 'system') {
-      out.push({ role: 'system', content: typeof msg.content === 'string' ? msg.content : '' });
-      continue;
-    }
+    if (msg.role === 'system') continue;
 
     if (msg.role === 'assistant') {
       if (Array.isArray(msg.content)) {
@@ -147,19 +275,14 @@ function toOllamaMessages(body) {
       }
     }
   }
-
   return out;
 }
 
 function toOllamaTools(tools) {
-  if (!tools?.length) return undefined;
+  if (!tools?.length) return [];
   return tools.map(t => ({
     type: 'function',
-    function: {
-      name: t.name,
-      description: t.description || '',
-      parameters: t.input_schema || { type: 'object', properties: {} },
-    },
+    function: { name: t.name, description: t.description || '', parameters: t.input_schema || { type: 'object', properties: {} } },
   }));
 }
 
@@ -172,182 +295,170 @@ function toolId() {
   return `toolu_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
 }
 
-// ─── Streaming: Ollama NDJSON → Anthropic SSE ────────────────────────────────
+// ─── SSE helpers ──────────────────────────────────────────────────────────────
 
 function sse(res, event, data) {
   res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
 }
 
-async function handleStream(ollamaBody, res, model) {
-  const msgId = `msg_${Date.now().toString(36)}`;
-
+function sseOpen(res, model) {
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('X-Accel-Buffering', 'no');
-
   sse(res, 'message_start', {
     type: 'message_start',
-    message: { id: msgId, type: 'message', role: 'assistant', content: [], model, stop_reason: null, usage: { input_tokens: 0, output_tokens: 0 } },
+    message: { id: `msg_${Date.now().toString(36)}`, type: 'message', role: 'assistant', content: [], model, stop_reason: null, usage: { input_tokens: 0, output_tokens: 0 } },
   });
   sse(res, 'ping', { type: 'ping' });
-  sse(res, 'content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } });
-
-  let ollamaRes;
-  try {
-    ollamaRes = await fetch(`${OLLAMA}/api/chat`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ ...ollamaBody, stream: true }),
-      signal: AbortSignal.timeout(180000),
-    });
-  } catch (e) {
-    sse(res, 'content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: `\n\n❌ Cannot reach Ollama: ${e.message}` } });
-    sse(res, 'content_block_stop',  { type: 'content_block_stop',  index: 0 });
-    sse(res, 'message_delta', { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 0 } });
-    sse(res, 'message_stop',  { type: 'message_stop' });
-    return { inputTokens: 0, outputTokens: 0, toolCalls: 0 };
-  }
-
-  const reader  = ollamaRes.body.getReader();
-  const decoder = new TextDecoder();
-  let buf = '', blockIndex = 0, inputTokens = 0, outputTokens = 0, calls = null;
-
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buf += decoder.decode(value, { stream: true });
-    const lines = buf.split('\n');
-    buf = lines.pop() || '';
-
-    for (const line of lines) {
-      if (!line.trim()) continue;
-      let chunk;
-      try { chunk = JSON.parse(line); } catch { continue; }
-
-      if (!chunk.done && chunk.message?.content) {
-        sse(res, 'content_block_delta', {
-          type: 'content_block_delta', index: blockIndex,
-          delta: { type: 'text_delta', text: chunk.message.content },
-        });
-      }
-      if (chunk.done) {
-        if (chunk.message?.tool_calls?.length) calls = chunk.message.tool_calls;
-        inputTokens  = chunk.prompt_eval_count || 0;
-        outputTokens = chunk.eval_count || 0;
-      }
-    }
-  }
-
-  sse(res, 'content_block_stop', { type: 'content_block_stop', index: blockIndex });
-  blockIndex++;
-
-  if (calls?.length) {
-    for (const tc of calls) {
-      const id = toolId();
-      const argsStr = typeof tc.function.arguments === 'string'
-        ? tc.function.arguments
-        : JSON.stringify(tc.function.arguments);
-      sse(res, 'content_block_start', {
-        type: 'content_block_start', index: blockIndex,
-        content_block: { type: 'tool_use', id, name: tc.function.name, input: {} },
-      });
-      sse(res, 'content_block_delta', {
-        type: 'content_block_delta', index: blockIndex,
-        delta: { type: 'input_json_delta', partial_json: argsStr },
-      });
-      sse(res, 'content_block_stop', { type: 'content_block_stop', index: blockIndex });
-      blockIndex++;
-    }
-  }
-
-  const stopReason = calls?.length ? 'tool_use' : 'end_turn';
-  sse(res, 'message_delta', { type: 'message_delta', delta: { stop_reason: stopReason }, usage: { output_tokens: outputTokens } });
-  sse(res, 'message_stop',  { type: 'message_stop' });
-
-  return { inputTokens, outputTokens, toolCalls: calls?.length || 0 };
 }
 
-// ─── Non-streaming ────────────────────────────────────────────────────────────
+async function sseText(res, text, blockIndex) {
+  sse(res, 'content_block_start', { type: 'content_block_start', index: blockIndex, content_block: { type: 'text', text: '' } });
+  for (let i = 0; i < text.length; i += 8) {
+    sse(res, 'content_block_delta', { type: 'content_block_delta', index: blockIndex, delta: { type: 'text_delta', text: text.slice(i, i + 8) } });
+    if (i % 80 === 0) await new Promise(r => setTimeout(r, 5));
+  }
+  sse(res, 'content_block_stop', { type: 'content_block_stop', index: blockIndex });
+  return blockIndex + 1;
+}
 
-async function handleNonStream(ollamaBody, res, model) {
-  const ollamaRes = await fetch(`${OLLAMA}/api/chat`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ ...ollamaBody, stream: false }),
-    signal: AbortSignal.timeout(180000),
-  });
-  if (!ollamaRes.ok) throw new Error(`Ollama ${ollamaRes.status}: ${await ollamaRes.text()}`);
+function sseToolUse(res, calls, blockIndex, outputTokens) {
+  let idx = blockIndex;
+  for (const tc of calls) {
+    const id = toolId();
+    const args = typeof tc.function.arguments === 'string' ? tc.function.arguments : JSON.stringify(tc.function.arguments);
+    sse(res, 'content_block_start', { type: 'content_block_start', index: idx, content_block: { type: 'tool_use', id, name: tc.function.name, input: {} } });
+    sse(res, 'content_block_delta', { type: 'content_block_delta', index: idx, delta: { type: 'input_json_delta', partial_json: args } });
+    sse(res, 'content_block_stop', { type: 'content_block_stop', index: idx });
+    idx++;
+  }
+  sse(res, 'message_delta', { type: 'message_delta', delta: { stop_reason: 'tool_use' }, usage: { output_tokens: outputTokens } });
+  sse(res, 'message_stop', { type: 'message_stop' });
+}
 
-  const data = await ollamaRes.json();
-  const msg  = data.message || {};
-  const content = [];
-  if (msg.content) content.push({ type: 'text', text: msg.content });
-  for (const tc of (msg.tool_calls || [])) {
-    content.push({ type: 'tool_use', id: toolId(), name: tc.function.name, input: parseArgs(tc.function.arguments) });
+// ─── Core agent loop ──────────────────────────────────────────────────────────
+
+async function runAgentLoop(body, res) {
+  const model   = selectModel(body);
+  const session = getOrCreateSession(body.messages || []);
+  const stream  = body.stream !== false;
+  const pw      = new PlaywrightClient(PLAYWRIGHT);
+
+  // Merge Claude Code tools + browser tools
+  const claudeTools  = toOllamaTools(body.tools);
+  const allTools     = [...claudeTools, ...BROWSER_TOOLS];
+  const history      = toOllamaMessages(body);
+
+  let totalInput = 0, totalOutput = 0, totalToolCalls = 0;
+
+  if (stream) sseOpen(res, model);
+
+  for (let turn = 0; turn < 8; turn++) {
+    let data;
+    try {
+      const r = await fetch(`${OLLAMA}/api/chat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model, messages: history, tools: allTools, stream: false, options: { num_predict: body.max_tokens || 8192 } }),
+        signal: AbortSignal.timeout(180000),
+      });
+      if (!r.ok) throw new Error(`Ollama ${r.status}: ${await r.text()}`);
+      data = await r.json();
+    } catch (e) {
+      const errMsg = `\n\n❌ ${e.message}`;
+      if (stream) {
+        await sseText(res, errMsg, 0);
+        sse(res, 'message_delta', { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 0 } });
+        sse(res, 'message_stop', { type: 'message_stop' });
+        res.end();
+      } else {
+        res.json({ id: `msg_${Date.now()}`, type: 'message', role: 'assistant', content: [{ type: 'text', text: errMsg }], model, stop_reason: 'end_turn', usage: { input_tokens: 0, output_tokens: 0 } });
+      }
+      updateSession(session, { inputTokens: totalInput, outputTokens: totalOutput, toolCalls: totalToolCalls, model });
+      return;
+    }
+
+    totalInput  += data.prompt_eval_count || 0;
+    totalOutput += data.eval_count || 0;
+
+    const msg   = data.message || {};
+    const calls = msg.tool_calls;
+
+    // ── No tool calls: final text response ──────────────────
+    if (!calls?.length) {
+      const text = msg.content || '';
+      if (stream) {
+        await sseText(res, text, 0);
+        sse(res, 'message_delta', { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: totalOutput } });
+        sse(res, 'message_stop', { type: 'message_stop' });
+        res.end();
+      } else {
+        res.json({ id: `msg_${Date.now().toString(36)}`, type: 'message', role: 'assistant', content: [{ type: 'text', text }], model, stop_reason: 'end_turn', usage: { input_tokens: totalInput, output_tokens: totalOutput } });
+      }
+      break;
+    }
+
+    const browserCalls = calls.filter(tc => BROWSER_TOOL_NAMES.has(tc.function.name));
+    const claudeCalls  = calls.filter(tc => !BROWSER_TOOL_NAMES.has(tc.function.name));
+
+    // ── Only Claude Code tools: return to Claude Code ───────
+    if (!browserCalls.length) {
+      if (stream) {
+        let idx = 0;
+        if (msg.content) idx = await sseText(res, msg.content, idx);
+        sseToolUse(res, claudeCalls, idx, totalOutput);
+        res.end();
+      } else {
+        const content = [];
+        if (msg.content) content.push({ type: 'text', text: msg.content });
+        for (const tc of claudeCalls) {
+          content.push({ type: 'tool_use', id: toolId(), name: tc.function.name, input: parseArgs(tc.function.arguments) });
+        }
+        res.json({ id: `msg_${Date.now().toString(36)}`, type: 'message', role: 'assistant', content, model, stop_reason: 'tool_use', usage: { input_tokens: totalInput, output_tokens: totalOutput } });
+      }
+      break;
+    }
+
+    // ── Browser tools: execute internally, loop back ─────────
+    history.push({ role: 'assistant', content: msg.content || '', tool_calls: calls });
+
+    for (const tc of calls) {
+      const args = parseArgs(tc.function.arguments);
+      let result = '';
+      try {
+        if      (tc.function.name === 'web_search')        result = await webSearch(args.query);
+        else if (tc.function.name === 'browser_navigate')  result = await pw.navigate(args.url);
+        else if (tc.function.name === 'browser_snapshot')  result = await pw.snapshot();
+        else result = `Tool ${tc.function.name} is handled by your environment.`;
+      } catch (e) {
+        result = `Error: ${e.message}`;
+      }
+      totalToolCalls++;
+      history.push({ role: 'tool', content: result });
+    }
   }
 
-  const inputTokens  = data.prompt_eval_count || 0;
-  const outputTokens = data.eval_count || 0;
-
-  res.json({
-    id: `msg_${Date.now().toString(36)}`,
-    type: 'message',
-    role: 'assistant',
-    content,
-    model,
-    stop_reason: msg.tool_calls?.length ? 'tool_use' : 'end_turn',
-    stop_sequence: null,
-    usage: { input_tokens: inputTokens, output_tokens: outputTokens },
-  });
-
-  return { inputTokens, outputTokens, toolCalls: msg.tool_calls?.length || 0 };
+  updateSession(session, { inputTokens: totalInput, outputTokens: totalOutput, toolCalls: totalToolCalls, model });
 }
 
 // ─── Routes ───────────────────────────────────────────────────────────────────
 
 app.post('/v1/messages', async (req, res) => {
-  const body    = req.body;
-  const model   = selectModel(body);
-  const session = getOrCreateSession(body.messages || []);
-
-  const ollamaBody = {
-    model,
-    messages: toOllamaMessages(body),
-    options:  { num_predict: body.max_tokens || 8192 },
-  };
-  const tools = toOllamaTools(body.tools);
-  if (tools) ollamaBody.tools = tools;
-
   try {
-    let result;
-    if (body.stream !== false) {
-      result = await handleStream(ollamaBody, res, model);
-      res.end();
-    } else {
-      result = await handleNonStream(ollamaBody, res, model);
-    }
-    updateSession(session, { ...result, model });
+    await runAgentLoop(req.body, res);
   } catch (err) {
     console.error('[proxy]', err.message);
-    if (!res.headersSent) {
-      res.status(500).json({ type: 'error', error: { type: 'api_error', message: err.message } });
-    }
+    if (!res.headersSent) res.status(500).json({ type: 'error', error: { type: 'api_error', message: err.message } });
   }
 });
 
-// Claude Code queries this to validate the connection
 app.get('/v1/models', (_, res) => {
-  res.json({
-    object: 'list',
-    data: [
-      { id: 'claude-sonnet-4-6', object: 'model', created: 0, owned_by: 'yk-copilot' },
-      { id: MODEL_SMART,         object: 'model', created: 0, owned_by: 'ollama' },
-      { id: MODEL_FAST,          object: 'model', created: 0, owned_by: 'ollama' },
-    ],
-  });
+  res.json({ object: 'list', data: [
+    { id: 'claude-sonnet-4-6', object: 'model', created: 0, owned_by: 'yk-copilot' },
+    { id: MODEL_SMART,         object: 'model', created: 0, owned_by: 'ollama' },
+    { id: MODEL_FAST,          object: 'model', created: 0, owned_by: 'ollama' },
+  ]});
 });
-
-// ─── Dashboard API ────────────────────────────────────────────────────────────
 
 app.get('/api/sessions', (_, res) => res.json(serializeSessions()));
 
@@ -355,10 +466,10 @@ app.get('/api/stats', (_, res) => {
   const all = [...sessions.values()];
   res.json({
     totalSessions:     all.length,
-    totalRequests:     all.reduce((s, x) => s + x.requests,     0),
-    totalInputTokens:  all.reduce((s, x) => s + x.inputTokens,  0),
+    totalRequests:     all.reduce((s, x) => s + x.requests, 0),
+    totalInputTokens:  all.reduce((s, x) => s + x.inputTokens, 0),
     totalOutputTokens: all.reduce((s, x) => s + x.outputTokens, 0),
-    totalToolCalls:    all.reduce((s, x) => s + x.toolCalls,    0),
+    totalToolCalls:    all.reduce((s, x) => s + x.toolCalls, 0),
     modelFast:  MODEL_FAST,
     modelSmart: MODEL_SMART,
   });
@@ -366,16 +477,12 @@ app.get('/api/stats', (_, res) => {
 
 app.get('/health', (_, res) => res.json({ ok: true }));
 
-// ─── Dashboard SPA ────────────────────────────────────────────────────────────
-
 app.use(express.static(path.join(__dirname, 'public')));
 app.use((req, res) => {
-  if (req.path.startsWith('/v1/') || req.path.startsWith('/api/')) {
-    return res.status(404).json({ error: 'not found' });
-  }
+  if (req.path.startsWith('/v1/') || req.path.startsWith('/api/')) return res.status(404).json({ error: 'not found' });
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
 app.listen(PORT, '0.0.0.0', () =>
-  console.log(`[yk-copilot] port=${PORT} fast=${MODEL_FAST} smart=${MODEL_SMART} ollama=${OLLAMA}`)
+  console.log(`[yk-copilot] port=${PORT} fast=${MODEL_FAST} smart=${MODEL_SMART} ollama=${OLLAMA} playwright=${PLAYWRIGHT}`)
 );

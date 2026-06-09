@@ -7,12 +7,15 @@ services:
       - "${PROXY_PORT:-9999}:9999"
     environment:
       - OLLAMA_API_URL=http://yk_ollama:11434
+      - PLAYWRIGHT_MCP_URL=http://yk_playwright:8931
       - MODEL_FAST=${MODEL_FAST:-qwen2.5-coder:7b}
       - MODEL_SMART=${MODEL_SMART:-qwen2.5-coder:14b}
       - PROXY_PORT=9999
     depends_on:
       yk_model_init:
         condition: service_completed_successfully
+      yk_playwright:
+        condition: service_healthy
     networks:
       - yk_copilot_net
 
@@ -22,14 +25,16 @@ services:
     restart: unless-stopped
     volumes:
       - yk_ollama_data:/root/.ollama
+    environment:
+      - OLLAMA_KEEP_ALIVE=24h
     networks:
       - yk_copilot_net
     healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:11434/api/tags"]
-      interval: 5s
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
       timeout: 5s
       retries: 15
-      start_period: 10s
+      start_period: 15s
 
   yk_model_init:
     image: ollama/ollama
@@ -47,8 +52,35 @@ services:
     networks:
       - yk_copilot_net
 
+  yk_playwright:
+    build:
+      context: ./playwright-mcp
+      dockerfile: Dockerfile
+    container_name: yk_playwright
+    restart: unless-stopped
+    environment:
+      - PLAYWRIGHT_HEADLESS=true
+      - PLAYWRIGHT_BROWSER=${PLAYWRIGHT_BROWSER:-chromium}
+      - MCP_PORT=8931
+    shm_size: "1gb"
+    cap_add:
+      - SYS_ADMIN
+    security_opt:
+      - seccomp:unconfined
+    volumes:
+      - playwright_output:/output
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8931/"]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 30s
+    networks:
+      - yk_copilot_net
+
 networks:
   yk_copilot_net:
 
 volumes:
   yk_ollama_data:
+  playwright_output:
