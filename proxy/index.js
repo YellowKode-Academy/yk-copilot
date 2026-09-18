@@ -18,6 +18,31 @@ const MODEL_FAST  = process.env.MODEL_FAST         || 'qwen2.5-coder:7b';
 const MODEL_SMART = process.env.MODEL_SMART        || 'qwen2.5-coder:14b';
 const MODEL_VISION= process.env.MODEL_VISION       || 'gemma4:e4b';
 const PORT        = Number(process.env.PROXY_PORT  || 9999);
+// Claude Code's system prompt plus its tool definitions run well past 15k tokens.
+// Ollama defaults to a 4096-token window and drops the rest in silence, so the model
+// never sees the actual task. This has to be set explicitly or nothing works.
+const NUM_CTX     = Number(process.env.NUM_CTX      || 32768);
+// A local model on a laptop GPU is slow; a long ceiling costs nothing when idle.
+const OLLAMA_TIMEOUT = Number(process.env.OLLAMA_TIMEOUT_MS || 900000);
+// Claude Code's tool descriptions are written for a frontier model and are enormous:
+// all of them together came to ~18k tokens in testing, which on a small context is
+// the whole window before the user has said anything. A local model needs the name,
+// the parameters and a sentence of intent — not the full manual. 0 disables.
+const TOOL_DESC_LIMIT = Number(process.env.TOOL_DESC_LIMIT || 400);
+const ARG_DESC_LIMIT  = Number(process.env.ARG_DESC_LIMIT  || 120);
+// The host's system prompt is written for a frontier model: ~12k tokens of policy,
+// style and harness detail. A 7B model given the whole thing reliably drops the task
+// and answers in prose instead of calling the next tool — with the same prompt
+// trimmed it calls the tool correctly. 0 disables the trimming.
+const SYSTEM_LIMIT = Number(process.env.SYSTEM_LIMIT || 8000);
+// How much of a web page to hand the model. Reading is the slow part locally.
+const SNAPSHOT_LIMIT = Number(process.env.SNAPSHOT_LIMIT || 4000);
+// The proxy's own Playwright-backed browser tools, off by default. Claude Code
+// already has WebSearch and WebFetch, and offering a second near-identical set makes
+// the model shop between them — asked for a plain `flatten` function it spent six
+// turns trying to search the web for one. Set BROWSER_TOOLS=1 to offer them anyway,
+// which is worth doing when something other than Claude Code calls this API.
+const BROWSER_TOOLS_ENABLED = process.env.BROWSER_TOOLS === '1';
 
 // ─── Playwright MCP client ────────────────────────────────────────────────────
 
@@ -77,9 +102,11 @@ class PlaywrightClient {
 
   async navigate(url) { await this.tool('browser_navigate', { url }); return this.snapshot(); }
 
+  // A full page snapshot runs to tens of thousands of characters. A local model
+  // spends longer reading that than the browser spent fetching it, so cap it low.
   async snapshot() {
     const text = await this.tool('browser_snapshot', {});
-    return text.length > 10000 ? text.slice(0, 10000) + '\n[... truncated ...]' : text;
+    return text.length > SNAPSHOT_LIMIT ? text.slice(0, SNAPSHOT_LIMIT) + '\n[... truncated ...]' : text;
   }
 }
 
@@ -121,9 +148,9 @@ async function describeImages(images, userContext) {
           images,
         }],
         stream: false,
-        options: { num_predict: 1500 },
+        options: { num_ctx: 8192, num_predict: 1500 },
       }),
-      signal: AbortSignal.timeout(90000),
+      signal: AbortSignal.timeout(180000),
     });
     if (!r.ok) return null;
     const data = await r.json();
@@ -195,7 +222,56 @@ Available research tools (all 100% local via Playwright, no external APIs):
 Code editing tools are provided by your environment (file read/write, bash, etc.).
 Respond in the same language as the user. Be concise in explanations, thorough in execution.`;
 
+// Same guidance, minus the research tools, for when they are not being offered.
+// Advertising a tool the model does not have sends it looking for one.
+const PLANNING_SYSTEM_NO_BROWSER = `You are a precise, methodical coding assistant.
+
+For every non-trivial task follow this process:
+1. READ the full request carefully before any action
+2. PLAN: write a numbered list of steps before executing anything
+3. EXECUTE one step at a time, checking results before continuing
+4. VERIFY: after each tool call, confirm the result matches expectations
+5. ADJUST: if something fails, re-read the task, revise the plan, continue
+
+Answer from your own knowledge. You have no web access, so do not attempt to search
+or browse — if you are unsure, write the best answer you can and say what you are
+unsure about.
+
+Respond in the same language as the user. Be concise in explanations, thorough in execution.`;
+
 // ─── Session store ────────────────────────────────────────────────────────────
+
+// The chat template already renders tool schemas, but a small model reading 15+ of
+// them routinely invents a name close to the right one. A short, explicit roster of
+// exact names and parameters costs little context and prevents most of that.
+function toolRoster(tools) {
+  if (!tools?.length) return '';
+  const lines = tools.map(t => {
+    const props = t.function.parameters?.properties || {};
+    const req   = t.function.parameters?.required || [];
+    const args  = Object.keys(props).map(k => (req.includes(k) ? k : k + '?')).join(', ');
+    return `- ${t.function.name}(${args})`;
+  });
+  // Deliberately no instruction about output format here. A model with native tool
+  // calling handles that itself, and telling it to emit JSON instead makes it treat
+  // functions it reads in a source file as tools it is being offered.
+  return `Tool names available to you, for reference. Use these exact names and exact parameter names, and never invent one:\n${lines.join('\n')}`;
+}
+
+// Small models habitually narrate an action instead of taking it — "Let me modify
+// the function accordingly." — and then end the turn having changed nothing. Saying
+// so plainly, right at the end of the system message, fixes most of it.
+// Appended to the last message the model reads, where it carries the most weight.
+// Short on purpose: a long reminder here gets skimmed like the rest.
+const STEP_REMINDER = `[Call a tool now if the task is not finished. Do not write what you are going to do, and never write the output of a command you have not actually run.]`;
+
+const EXEC_NOTE = `Act, do not announce. If a step needs a tool, call the tool in this same turn. Never end your turn describing what you are about to do — either do it now, or report what you actually did. Only answer in prose when the work is finished or you genuinely need the user to decide something.`;
+
+const BROWSER_NOTE = `You also have three research tools provided by this proxy and run locally on this machine (no external API):
+- web_search(query): search the web, returns page content
+- browser_navigate(url): open any URL in a real browser (handles JavaScript-rendered pages)
+- browser_snapshot(): read the currently open browser page
+Use them whenever you need documentation or facts you do not already have.`;
 
 const sessions = new Map();
 
@@ -260,10 +336,37 @@ function extractSystem(body) {
   return null;
 }
 
-function toOllamaMessages(body) {
+// Keep the opening (identity and how to use tools) and the closing (working
+// directory, platform, project instructions), and drop the middle, which is mostly
+// policy a local model will not act on anyway.
+function trimSystem(text) {
+  if (!SYSTEM_LIMIT || !text || text.length <= SYSTEM_LIMIT) return text;
+  const head = Math.floor(SYSTEM_LIMIT * 0.6);
+  const tail = SYSTEM_LIMIT - head;
+  return `${text.slice(0, head)}\n\n[...trimmed for a local model's context...]\n\n${text.slice(-tail)}`;
+}
+
+function toOllamaMessages(body, allTools) {
   const out = [];
-  const envSystem = extractSystem(body);
-  out.push({ role: 'system', content: [PLANNING_SYSTEM, envSystem].filter(Boolean).join('\n\n') });
+  const rawSystem = extractSystem(body);
+  const envSystem = trimSystem(rawSystem);
+  if (rawSystem && envSystem !== rawSystem) {
+    console.log(`[system] host prompt ${Math.round(rawSystem.length / 1024)}KB -> ${Math.round(envSystem.length / 1024)}KB`);
+  }
+  // Claude Code ships a long system prompt of its own. Stacking a second full set of
+  // instructions on top of it contradicts the host and burns context a small model
+  // cannot spare, so when a host prompt is present we only add the browser-tool note.
+  const preamble = rawSystem && rawSystem.length > 2000 ? '' : (BROWSER_TOOLS_ENABLED ? PLANNING_SYSTEM : PLANNING_SYSTEM_NO_BROWSER);
+  const roster   = toolRoster(allTools);
+
+  // tool_use id -> name, so every tool result can say which call it answers
+  const toolNames = new Map();
+  for (const m of (body.messages || [])) {
+    if (m.role === 'assistant' && Array.isArray(m.content)) {
+      for (const c of m.content) if (c.type === 'tool_use' && c.id) toolNames.set(c.id, c.name);
+    }
+  }
+  out.push({ role: 'system', content: [preamble, envSystem, roster, EXEC_NOTE].filter(Boolean).join('\n\n') });
 
   for (const msg of (body.messages || [])) {
     if (msg.role === 'system') continue;
@@ -287,7 +390,8 @@ function toOllamaMessages(body) {
         if (toolResults.length) {
           for (const tr of toolResults) {
             const content = Array.isArray(tr.content) ? tr.content.map(c => c.text || '').join('\n') : (typeof tr.content === 'string' ? tr.content : '');
-            out.push({ role: 'tool', content });
+            // Small models lose track of which result answers which call without this
+            out.push({ role: 'tool', tool_name: toolNames.get(tr.tool_use_id) || 'tool', content });
           }
           continue;
         }
@@ -298,6 +402,40 @@ function toOllamaMessages(body) {
       }
     }
   }
+
+  // A small model weights the end of the context far more than the middle, and the
+  // system message is followed by thousands of tokens of host prompt and tool
+  // schemas. On a task with several steps the directive there gets diluted and the
+  // model starts writing what it would do — including inventing command output it
+  // never ran. Repeating it as the last thing it reads is what holds the loop.
+  if (allTools?.length && out.length > 1) {
+    const last = out[out.length - 1];
+    last.content = `${last.content || ''}\n\n${STEP_REMINDER}`;
+  }
+
+  return out;
+}
+
+// Cut at a sentence or line break where possible, so the text does not end mid-word.
+function clip(text, limit) {
+  if (!limit || !text || text.length <= limit) return text || '';
+  const head = text.slice(0, limit);
+  const cut  = Math.max(head.lastIndexOf('. '), head.lastIndexOf('\n'));
+  return (cut > limit * 0.5 ? head.slice(0, cut + 1) : head).trim();
+}
+
+function compactSchema(schema) {
+  if (!schema || typeof schema !== 'object') return { type: 'object', properties: {} };
+  const props = {};
+  for (const [k, v] of Object.entries(schema.properties || {})) {
+    const p = { type: v.type || 'string' };
+    if (v.description) p.description = clip(v.description, ARG_DESC_LIMIT);
+    if (v.enum) p.enum = v.enum;
+    if (v.items?.type) p.items = { type: v.items.type };
+    props[k] = p;
+  }
+  const out = { type: 'object', properties: props };
+  if (schema.required?.length) out.required = schema.required;
   return out;
 }
 
@@ -305,38 +443,125 @@ function toOllamaTools(tools) {
   if (!tools?.length) return [];
   return tools.map(t => ({
     type: 'function',
-    function: { name: t.name, description: t.description || '', parameters: t.input_schema || { type: 'object', properties: {} } },
+    function: {
+      name: t.name,
+      description: clip(t.description || '', TOOL_DESC_LIMIT),
+      parameters: compactSchema(t.input_schema),
+    },
   }));
 }
 
-// Fallback: some small models return tool calls as JSON text instead of tool_calls field.
-// Supports: {"name":"x","arguments":{}} and {"name":"x","parameters":{}}
+// Small models frequently narrate a tool call as text instead of using the native
+// tool_calls field. qwen2.5-coder never uses the native field at all. So the text has
+// to be mined for calls, tolerating <tool_call> tags, code fences, JSON embedded in
+// prose, and the several argument key names different models settle on.
+function extractJsonObjects(text) {
+  const out = [];
+  for (let i = 0; i < text.length; i++) {
+    if (text[i] !== '{' && text[i] !== '[') continue;
+    const open = text[i], close = open === '{' ? '}' : ']';
+    let depth = 0, inStr = false, esc = false;
+    for (let j = i; j < text.length; j++) {
+      const ch = text[j];
+      if (esc) { esc = false; continue; }
+      if (ch === '\\') { esc = true; continue; }
+      if (ch === '"') { inStr = !inStr; continue; }
+      if (inStr) continue;
+      if (ch === open) depth++;
+      else if (ch === close) {
+        depth--;
+        if (depth === 0) {
+          try { out.push(JSON.parse(text.slice(i, j + 1))); } catch {}
+          i = j;
+          break;
+        }
+      }
+    }
+  }
+  return out;
+}
+
+// Models get the tool name almost right ("read_file", "ReadFile" for "Read"). Match
+// on a normalised form, then on prefix, before giving up.
+function resolveToolName(raw, knownNames) {
+  if (typeof raw !== 'string' || !raw) return null;
+  if (knownNames.has(raw)) return raw;
+  const norm = (x) => x.toLowerCase().replace(/[^a-z0-9]/g, '');
+  const n = norm(raw);
+  for (const k of knownNames) if (norm(k) === n) return k;
+  let best = null;
+  for (const k of knownNames) {
+    const nk = norm(k);
+    if (nk.length < 3) continue;
+    if (n === nk || n.startsWith(nk) || nk.startsWith(n)) {
+      if (!best || nk.length > norm(best).length) best = k;
+    }
+  }
+  return best;
+}
+
+// Qwen3-Coder falls back to an XML-ish form of its own rather than JSON:
+//   <function=Edit><parameter=file_path>calc.py</parameter>...</function>
+// It uses the native tool_calls field most of the time, but not always, and a missed
+// call here reads to the user as the model refusing to act.
+function parseXmlToolCalls(text, knownNames) {
+  const calls = [];
+  for (const m of text.matchAll(/<function=([^>\s]+)\s*>([\s\S]*?)<\/function>/gi)) {
+    const name = resolveToolName(m[1].trim(), knownNames);
+    if (!name) continue;
+    const args = {};
+    for (const p of m[2].matchAll(/<parameter=([^>\s]+)\s*>([\s\S]*?)<\/parameter>/gi)) {
+      args[p[1].trim()] = p[2].replace(/^\r?\n/, '').replace(/\r?\n$/, '');
+    }
+    calls.push({ function: { name, arguments: args } });
+  }
+  return calls.length ? calls : null;
+}
+
 function tryParseTextToolCalls(text, knownNames) {
-  const t = (text || '').trim();
-  // Strip markdown code fences if present
-  const stripped = t.replace(/^```(?:json)?\n?/i, '').replace(/\n?```$/, '').trim();
-  try {
-    const obj = JSON.parse(stripped);
-    // Single call: {name, arguments|parameters|input}
-    const name = obj.name || obj.function;
-    const args = obj.arguments ?? obj.parameters ?? obj.input ?? {};
-    if (typeof name === 'string' && knownNames.has(name)) {
-      return [{ function: { name, arguments: args } }];
+  let t = (text || '').trim();
+  if (!t) return null;
+
+  const xml = parseXmlToolCalls(t, knownNames);
+  if (xml) return xml;
+
+  // <tool_call>{...}</tool_call>, the Qwen/Hermes convention
+  const tagged = [...t.matchAll(/<tool_call>([\s\S]*?)<\/tool_call>/gi)].map(m => m[1]);
+  if (tagged.length) t = tagged.join('\n');
+
+  // Strip code fences
+  t = t.replace(/```(?:json|tool_code)?\s*/gi, '').replace(/```/g, '');
+
+  const calls = [];
+  for (const obj of extractJsonObjects(t)) {
+    for (const cand of Array.isArray(obj) ? obj : [obj]) {
+      if (!cand || typeof cand !== 'object') continue;
+      const rawName = cand.name || cand.tool || cand.tool_name || cand.function;
+      const name = resolveToolName(typeof rawName === 'object' ? rawName?.name : rawName, knownNames);
+      if (!name) continue;
+      const args = cand.arguments ?? cand.parameters ?? cand.input ?? cand.args ?? cand.function?.arguments ?? {};
+      calls.push({ function: { name, arguments: args } });
     }
-    // Array of calls
-    if (Array.isArray(obj)) {
-      const parsed = obj
-        .filter(o => typeof (o.name || o.function) === 'string' && knownNames.has(o.name || o.function))
-        .map(o => ({ function: { name: o.name || o.function, arguments: o.arguments ?? o.parameters ?? o.input ?? {} } }));
-      if (parsed.length) return parsed;
-    }
-  } catch {}
-  return null;
+  }
+  return calls.length ? calls : null;
 }
 
 function parseArgs(args) {
   if (typeof args === 'object' && args !== null) return args;
   try { return JSON.parse(args); } catch { return {}; }
+}
+
+// Each pass of the agent loop appends its own text block. Clients commonly read only
+// the first one, so collapse runs of text into a single block.
+function mergeText(parts) {
+  if (!parts.length) return [{ type: 'text', text: '' }];
+  const out = [];
+  for (const p of parts) {
+    const prev = out[out.length - 1];
+    if (p.type === 'text' && prev?.type === 'text') prev.text += (prev.text ? '\n\n' : '') + p.text;
+    else out.push({ ...p });
+  }
+  return out;
 }
 
 function toolId() {
@@ -381,6 +606,53 @@ function sseToolUse(res, calls, blockIndex, outputTokens) {
 
 // ─── Core agent loop ──────────────────────────────────────────────────────────
 
+// ─── Ollama call (real streaming) ────────────────────────────────────────────
+
+// Streams from Ollama and reports text as it arrives. Returning only at the end
+// would leave Claude Code staring at a blank screen for minutes on a local model.
+async function ollamaChat({ model, history, tools, maxTokens, onText }) {
+  const r = await fetch(`${OLLAMA}/api/chat`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      model,
+      messages: history,
+      tools,
+      stream: true,
+      options: { num_ctx: NUM_CTX, num_predict: Math.min(maxTokens || 8192, 16384) },
+    }),
+    signal: AbortSignal.timeout(OLLAMA_TIMEOUT),
+  });
+  if (!r.ok) throw new Error(`Ollama ${r.status}: ${(await r.text()).slice(0, 300)}`);
+
+  const reader = r.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = '', content = '', promptEval = 0, evalCount = 0;
+  const toolCalls = [];
+
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    const lines = buf.split('\n');
+    buf = lines.pop() || '';
+    for (const line of lines) {
+      const t = line.trim();
+      if (!t) continue;
+      let d;
+      try { d = JSON.parse(t); } catch { continue; }
+      if (d.error) throw new Error(String(d.error));
+      const piece = d.message?.content || '';
+      if (piece) { content += piece; if (onText) onText(piece, content); }
+      if (d.message?.tool_calls?.length) toolCalls.push(...d.message.tool_calls);
+      if (d.done) { promptEval = d.prompt_eval_count || 0; evalCount = d.eval_count || 0; }
+    }
+  }
+  return { content, toolCalls, promptEval, evalCount };
+}
+
+// ─── Core agent loop ──────────────────────────────────────────────────────────
+
 async function runAgentLoop(body, res) {
   const stream  = body.stream !== false;
   const session = getOrCreateSession(body.messages || []);
@@ -407,10 +679,16 @@ async function runAgentLoop(body, res) {
   // ── Step 2: Select code model and build history ────────────
   const model       = selectModel(cleanBody);
   const claudeTools = toOllamaTools(cleanBody.tools);
-  const allTools    = [...claudeTools, ...BROWSER_TOOLS];
-  const history     = toOllamaMessages(cleanBody);
+  const allTools    = BROWSER_TOOLS_ENABLED ? [...claudeTools, ...BROWSER_TOOLS] : claudeTools;
+  const knownNames  = new Set(allTools.map(t => t.function.name));
+  const history     = toOllamaMessages(cleanBody, allTools);
 
-  // Inject vision context (description or fallback note) after system message
+  if (claudeTools.length) {
+    const before = JSON.stringify(cleanBody.tools).length;
+    const after  = JSON.stringify(claudeTools).length;
+    console.log(`[tools] ${claudeTools.length} tools, schema ${Math.round(before / 1024)}KB -> ${Math.round(after / 1024)}KB (~${Math.round(after / 4)} tokens)`);
+  }
+
   const visionInject = visionDescription
     ? `[Vision Analysis by ${MODEL_VISION}]\n\n${visionDescription}`
     : visionContext;
@@ -422,94 +700,138 @@ async function runAgentLoop(body, res) {
   }
 
   let totalInput = 0, totalOutput = 0, totalToolCalls = 0;
+  let blockIndex = 0, textOpen = false;
+  const parts = [];   // assembled response, non-streaming path
+
+  const openText  = () => {
+    if (textOpen) return;
+    sse(res, 'content_block_start', { type: 'content_block_start', index: blockIndex, content_block: { type: 'text', text: '' } });
+    textOpen = true;
+  };
+  const deltaText = (t) => {
+    if (!t) return;
+    openText();
+    sse(res, 'content_block_delta', { type: 'content_block_delta', index: blockIndex, delta: { type: 'text_delta', text: t } });
+  };
+  const closeText = () => {
+    if (!textOpen) return;
+    sse(res, 'content_block_stop', { type: 'content_block_stop', index: blockIndex });
+    blockIndex++;
+    textOpen = false;
+  };
+  const finish = (stopReason) => {
+    sse(res, 'message_delta', { type: 'message_delta', delta: { stop_reason: stopReason }, usage: { output_tokens: totalOutput } });
+    sse(res, 'message_stop', { type: 'message_stop' });
+    res.end();
+  };
+  const done = () => updateSession(session, {
+    inputTokens: totalInput, outputTokens: totalOutput, toolCalls: totalToolCalls,
+    model: visionDescription ? `${MODEL_VISION}+${model}` : model,
+  });
 
   if (stream) sseOpen(res, model);
 
   // ── Step 3: Code model agent loop ─────────────────────────
   for (let turn = 0; turn < 8; turn++) {
-    let data;
+    // A model may narrate a tool call as text rather than use the native field: bare
+    // JSON, <tool_call>, or Qwen3-Coder's <function=Name>. None of that should reach
+    // the user, and it cannot be taken back once streamed. So a reply that opens like
+    // a call is held entirely, and one that starts as prose is streamed only up to
+    // the point a call marker appears.
+    let gate = null;   // null = undecided, 'hold' | 'pass'
+    let held = '';
+    let emitted = 0;   // chars of `full` already sent, in 'pass' mode
+
+    const CALL_MARKER = /<function=|<tool_call>/i;
+
+    const onText = (piece, full) => {
+      if (!stream) return;
+      if (gate === null) {
+        const t = full.trimStart();
+        if (!t) return;
+        gate = /^[`{[<]/.test(t) ? 'hold' : 'pass';
+        if (gate === 'hold') { held = full; return; }
+      }
+      if (gate === 'hold') { held += piece; return; }
+
+      // Prose so far — send only what precedes any tool-call marker.
+      const at = full.search(CALL_MARKER);
+      const safeEnd = at === -1 ? full.length : at;
+      if (safeEnd > emitted) {
+        deltaText(full.slice(emitted, safeEnd));
+        emitted = safeEnd;
+      }
+    };
+
+    let result;
     try {
-      const r = await fetch(`${OLLAMA}/api/chat`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ model, messages: history, tools: allTools, stream: false, options: { num_predict: body.max_tokens || 8192 } }),
-        signal: AbortSignal.timeout(180000),
-      });
-      if (!r.ok) throw new Error(`Ollama ${r.status}: ${await r.text()}`);
-      data = await r.json();
+      result = await ollamaChat({ model, history, tools: allTools, maxTokens: cleanBody.max_tokens, onText });
     } catch (e) {
       const errMsg = `\n\n❌ ${e.message}`;
-      if (stream) { await sseText(res, errMsg, 0); sse(res, 'message_delta', { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 0 } }); sse(res, 'message_stop', { type: 'message_stop' }); res.end(); }
-      else res.json({ id: `msg_err`, type: 'message', role: 'assistant', content: [{ type: 'text', text: errMsg }], model, stop_reason: 'end_turn', usage: { input_tokens: 0, output_tokens: 0 } });
-      updateSession(session, { inputTokens: totalInput, outputTokens: totalOutput, toolCalls: totalToolCalls, model: `${MODEL_VISION}+${model}` });
+      console.error('[ollama]', e.message);
+      if (stream) { deltaText(errMsg); closeText(); finish('end_turn'); }
+      else res.json({ id: 'msg_err', type: 'message', role: 'assistant', content: [{ type: 'text', text: errMsg }], model, stop_reason: 'end_turn', usage: { input_tokens: totalInput, output_tokens: totalOutput } });
+      done();
       return;
     }
 
-    totalInput  += data.prompt_eval_count || 0;
-    totalOutput += data.eval_count || 0;
+    totalInput  += result.promptEval;
+    totalOutput += result.evalCount;
 
-    const msg = data.message || {};
-    // Some smaller models embed tool calls as JSON in content instead of tool_calls field.
-    // Detect and normalise so Claude Code always gets proper tool_use blocks.
-    let calls = msg.tool_calls;
-    if (!calls?.length && msg.content) {
-      const knownNames = new Set(allTools.map(t => t.function.name));
-      calls = tryParseTextToolCalls(msg.content, knownNames) || calls;
+    let calls = result.toolCalls;
+    let callsFromText = false;
+    if (!calls?.length && result.content) {
+      const parsed = tryParseTextToolCalls(result.content, knownNames);
+      if (parsed) { calls = parsed; callsFromText = true; }
     }
 
-    // No tool calls: final text response
+    // What we held back was prose after all, not a tool call — release it
+    if (stream && gate === 'hold' && !callsFromText) { deltaText(held); held = ''; }
+    if (!callsFromText && result.content) parts.push({ type: 'text', text: result.content });
+
+    // No tool calls: this is the final answer
     if (!calls?.length) {
-      const text = msg.content || '';
-      if (stream) {
-        await sseText(res, text, 0);
-        sse(res, 'message_delta', { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: totalOutput } });
-        sse(res, 'message_stop', { type: 'message_stop' });
-        res.end();
-      } else {
-        res.json({ id: `msg_${Date.now().toString(36)}`, type: 'message', role: 'assistant', content: [{ type: 'text', text }], model, stop_reason: 'end_turn', usage: { input_tokens: totalInput, output_tokens: totalOutput } });
-      }
+      if (stream) { closeText(); finish('end_turn'); }
+      else res.json({ id: `msg_${Date.now().toString(36)}`, type: 'message', role: 'assistant', content: mergeText(parts), model, stop_reason: 'end_turn', usage: { input_tokens: totalInput, output_tokens: totalOutput } });
       break;
     }
 
     const browserCalls = calls.filter(tc => BROWSER_TOOL_NAMES.has(tc.function.name));
     const claudeCalls  = calls.filter(tc => !BROWSER_TOOL_NAMES.has(tc.function.name));
 
-    // Only Claude Code tools: return to Claude Code to execute
+    // Only Claude Code tools: hand them back for Claude Code to execute
     if (!browserCalls.length) {
       if (stream) {
-        let idx = 0;
-        if (msg.content) idx = await sseText(res, msg.content, idx);
-        sseToolUse(res, claudeCalls, idx, totalOutput);
+        closeText();
+        sseToolUse(res, claudeCalls, blockIndex, totalOutput);
         res.end();
       } else {
-        const content = [];
-        if (msg.content) content.push({ type: 'text', text: msg.content });
-        for (const tc of claudeCalls) content.push({ type: 'tool_use', id: toolId(), name: tc.function.name, input: parseArgs(tc.function.arguments) });
-        res.json({ id: `msg_${Date.now().toString(36)}`, type: 'message', role: 'assistant', content, model, stop_reason: 'tool_use', usage: { input_tokens: totalInput, output_tokens: totalOutput } });
+        for (const tc of claudeCalls) parts.push({ type: 'tool_use', id: toolId(), name: tc.function.name, input: parseArgs(tc.function.arguments) });
+        res.json({ id: `msg_${Date.now().toString(36)}`, type: 'message', role: 'assistant', content: mergeText(parts), model, stop_reason: 'tool_use', usage: { input_tokens: totalInput, output_tokens: totalOutput } });
       }
       break;
     }
 
-    // Browser tools: execute internally and loop back
-    history.push({ role: 'assistant', content: msg.content || '', tool_calls: calls });
+    // Browser tools: run them here and loop back
+    if (stream) closeText();
+    history.push({ role: 'assistant', content: result.content || '', tool_calls: calls });
     const pw = new PlaywrightClient(PLAYWRIGHT);
 
     for (const tc of calls) {
       const args = parseArgs(tc.function.arguments);
-      let result = '';
+      let out = '';
       try {
-        if      (tc.function.name === 'web_search')       result = await webSearch(args.query, pw);
-        else if (tc.function.name === 'browser_navigate') result = await pw.navigate(args.url);
-        else if (tc.function.name === 'browser_snapshot') result = await pw.snapshot();
-        else result = `Tool ${tc.function.name} is handled by your environment.`;
-      } catch (e) { result = `Error: ${e.message}`; }
+        if      (tc.function.name === 'web_search')       out = await webSearch(args.query, pw);
+        else if (tc.function.name === 'browser_navigate') out = await pw.navigate(args.url);
+        else if (tc.function.name === 'browser_snapshot') out = await pw.snapshot();
+        else out = `Tool ${tc.function.name} is handled by your environment.`;
+      } catch (e) { out = `Error: ${e.message}`; }
       totalToolCalls++;
-      history.push({ role: 'tool', content: result });
+      history.push({ role: 'tool', tool_name: tc.function.name, content: out });
     }
   }
 
-  const usedModels = visionDescription ? `${MODEL_VISION}+${model}` : model;
-  updateSession(session, { inputTokens: totalInput, outputTokens: totalOutput, toolCalls: totalToolCalls, model: usedModels });
+  done();
 }
 
 // ─── Routes ───────────────────────────────────────────────────────────────────
@@ -520,6 +842,24 @@ app.post('/v1/messages', async (req, res) => {
     console.error('[proxy]', err.message);
     if (!res.headersSent) res.status(500).json({ type: 'error', error: { type: 'api_error', message: err.message } });
   }
+});
+
+// Rough token estimate. Claude Code calls this to size the context window; an
+// approximation from character count is close enough and costs no inference.
+app.post('/v1/messages/count_tokens', (req, res) => {
+  const b = req.body || {};
+  let chars = (extractSystem(b) || '').length;
+  for (const m of (b.messages || [])) {
+    if (!Array.isArray(m.content)) { chars += String(m.content || '').length; continue; }
+    for (const c of m.content) {
+      if      (c.type === 'text')        chars += (c.text || '').length;
+      else if (c.type === 'tool_result') chars += JSON.stringify(c.content || '').length;
+      else if (c.type === 'tool_use')    chars += JSON.stringify(c.input || {}).length;
+      else if (c.type === 'image')       chars += 6000;   // stand-in for image tokens
+    }
+  }
+  for (const t of (b.tools || [])) chars += JSON.stringify(t).length;
+  res.json({ input_tokens: Math.ceil(chars / 4) });
 });
 
 app.get('/v1/models', (_, res) => {
@@ -555,6 +895,17 @@ app.use((req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
-app.listen(PORT, '0.0.0.0', () =>
-  console.log(`[yk-copilot] port=${PORT} fast=${MODEL_FAST} smart=${MODEL_SMART} vision=${MODEL_VISION} ollama=${OLLAMA}`)
-);
+app.listen(PORT, '0.0.0.0', async () => {
+  console.log(`[yk-copilot] port=${PORT} ctx=${NUM_CTX} fast=${MODEL_FAST} smart=${MODEL_SMART} vision=${MODEL_VISION}`);
+  console.log(`[yk-copilot] ollama=${OLLAMA}`);
+  try {
+    const r = await fetch(`${OLLAMA}/api/tags`, { signal: AbortSignal.timeout(5000) });
+    const names = (await r.json()).models?.map(m => m.name) || [];
+    console.log(`[yk-copilot] ollama OK, ${names.length} model(s): ${names.join(', ')}`);
+    for (const need of [MODEL_FAST, MODEL_SMART, MODEL_VISION]) {
+      if (!names.includes(need)) console.warn(`[yk-copilot] WARNING: model not pulled: ${need}`);
+    }
+  } catch (e) {
+    console.error(`[yk-copilot] WARNING: cannot reach Ollama at ${OLLAMA} (${e.message})`);
+  }
+});

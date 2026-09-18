@@ -13,11 +13,16 @@ Local AI coding assistant for Claude Code. No API key, no cost, 100% on your mac
 
 ## What it is
 
-A proxy that sits between Claude Code and Ollama, translating the Anthropic API format into Ollama requests. Claude Code thinks it is talking to Anthropic — it is actually talking to local models running on your machine.
+A proxy that sits between Claude Code and Ollama. Claude Code thinks it is talking to Anthropic — it is actually talking to a model running on your machine.
 
-- Routes requests to the right model based on complexity
-- Describes images with a vision model, then passes context to the code model
-- Runs web searches via a local Playwright browser (no external API)
+Ollama has served the Anthropic Messages format natively since v0.14, so translation alone is no longer a reason to run this. Context is. The same 3-step task, same model, same machine, run both ways: pointed straight at Ollama the model lost the task and wrote nothing (689s); through this proxy it added the function, wrote four unit tests and ran them (600s). The difference is that the proxy compresses what Claude Code sends before the model has to read it.
+
+Getting this to work is mostly a fight for context. Claude Code's system prompt and tool definitions are written for a frontier model with a huge window: measured here, **27 KB of system prompt and 88 KB of tool schemas — around 18,000 tokens before you have typed anything.** A 7B model on a laptop GPU does not have room for that and the conversation. So the proxy compresses both on the way through, and that compression is what makes local coding actually work rather than merely start.
+
+- Compresses tool schemas and the host system prompt to fit a local context window
+- Routes to a fast or a smart model depending on the request
+- Describes images with a vision model, then hands the text to the code model
+- Runs web searches through a local Playwright browser (no external API)
 - Tracks sessions, tokens and tool calls on a local dashboard
 
 ## How it works
@@ -26,12 +31,14 @@ A proxy that sits between Claude Code and Ollama, translating the Anthropic API 
 Claude Code CLI / VS Code Extension
         |  ANTHROPIC_BASE_URL=http://localhost:9999
     yk-copilot proxy  (port 9999)
-        |-- simple requests   -> qwen2.5-coder:7b  (fast)
-        |-- complex / tools   -> qwen2.5-coder:14b (smart)
-        |-- images            -> gemma4:e4b describes -> qwen executes
+        |-- compress tool schemas   88KB -> 22KB
+        |-- compress system prompt  27KB ->  8KB
+        |-- simple requests   -> MODEL_FAST
+        |-- complex / tools   -> MODEL_SMART  (everything Claude Code sends)
+        |-- images            -> MODEL_VISION describes -> code model executes
         |-- web_search        -> Playwright (local browser, no API key)
         |
-    Ollama (qwen2.5-coder + gemma4)
+    Ollama (native on the host, or in a container)
 
 Dashboard: http://localhost:9999
 ```
@@ -40,6 +47,69 @@ Dashboard: http://localhost:9999
 
 - [Docker Desktop](https://www.docker.com/products/docker-desktop/)
 - [Claude Code](https://claude.ai/code) (CLI or VS Code extension)
+- [Ollama](https://ollama.com), installed natively — see below
+
+## Ollama: native, not in the container
+
+Docker Desktop on Mac and Windows does not pass the GPU through to containers, so an Ollama container there runs on CPU — around ten times slower, which for interactive coding means unusable. Install Ollama natively and it uses your GPU directly.
+
+```bash
+ollama pull qwen3-coder:30b
+ollama pull gemma3:4b
+```
+
+The proxy runs in a container and reaches the host through `host.docker.internal`, so Ollama has to listen on all interfaces rather than only on loopback. These four settings matter, and the last two are what let a 24k context fit on an 8 GB card at all:
+
+```bash
+# Mac / Linux
+export OLLAMA_HOST=0.0.0.0
+export OLLAMA_KEEP_ALIVE=24h
+export OLLAMA_FLASH_ATTENTION=1
+export OLLAMA_KV_CACHE_TYPE=q8_0
+```
+```powershell
+# Windows (PowerShell, once)
+[Environment]::SetEnvironmentVariable('OLLAMA_HOST','0.0.0.0:11434','User')
+[Environment]::SetEnvironmentVariable('OLLAMA_KEEP_ALIVE','24h','User')
+[Environment]::SetEnvironmentVariable('OLLAMA_FLASH_ATTENTION','1','User')
+[Environment]::SetEnvironmentVariable('OLLAMA_KV_CACHE_TYPE','q8_0','User')
+```
+
+Restart Ollama afterwards and confirm the settings took: `ollama ps` should show a 24-hour keep-alive once a model is loaded. A model larger than your VRAM will show a CPU/GPU split there, which is expected for an MoE and not a problem. Without `OLLAMA_KV_CACHE_TYPE=q8_0` the KV cache doubles and the runner dies mid-request with a dropped connection.
+
+**Containerized Ollama** is the fallback: no host install, CPU-only on Mac and Windows, GPU on Linux (uncomment the `deploy.resources` block under `yk_ollama`). Set `OLLAMA_API_URL=http://yk_ollama:11434` in `.env` and start with `docker compose --profile with-ollama up -d`.
+
+## Pick a model that does native tool calling
+
+This is the single most important choice, and the obvious pick is the wrong one.
+
+Claude Code is agentic: every request carries tool definitions and the answer is usually a tool call. A model whose Ollama template does not emit native `tool_calls` narrates JSON as prose instead, and the proxy has to guess. Measured here on the same prompt:
+
+| Model | Native `tool_calls` | Verdict |
+|---|---|---|
+| `qwen3-coder:30b` | yes | **use this** — the only one that finished a 3-step task |
+| `qwen2.5:7b` | yes, correct, fast | fine for single-step work, loses the thread on step 3 |
+| `qwen2.5-coder:7b` | never — always JSON as text | avoid despite the name |
+| `qwen3:8b` | yes | correct but 77–167s per turn; the thinking mode is not worth it |
+
+Note the second row carefully. A 7B model does real work — it edits a file, writes a correct function, answers about code. It fails on *chains*: asked to do three things in sequence it either narrates without acting or, worse, reports success on commands it never ran. If you code in small steps, a 7B is genuinely useful. If you want to hand over a task and walk away, you need the 30B.
+
+`qwen3-coder:30b` is a mixture-of-experts model: 30B total but only ~3.3B active per token. That is why it runs on a card that cannot hold it. Measured on an 8 GB RTX 4060 Laptop with the weights split 69% CPU / 31% GPU:
+
+- generation: **~28 tok/s**, steady from a small prompt up to 11k tokens of context
+- prompt digestion: ~1,500–2,400 tok/s once the model is warm
+- Ollama reuses the unchanged prefix between turns, so only new tokens cost anything
+- first load after a restart: ~20s
+
+Sizing for other cards:
+
+| VRAM | MODEL_SMART |
+|---|---|
+| 8 GB | `qwen3-coder:30b` (MoE, spills to RAM and still works) |
+| 12–16 GB | `qwen3-coder:30b` or `gpt-oss:20b` |
+| 24 GB+ | `qwen3-coder:30b` fully resident, or `glm-4.7-flash` |
+
+Set `MODEL_FAST` to the same model as `MODEL_SMART`. With `OLLAMA_MAX_LOADED_MODELS=1`, switching between two models costs a ~20s reload, and since Claude Code always sends tools it always lands on `MODEL_SMART` anyway.
 
 ## Getting started
 
@@ -48,93 +118,92 @@ git clone https://github.com/YellowKode-Academy/yk-copilot
 cd yk-copilot
 cp .env.example .env
 docker compose up -d
+node scripts/test.js --wait
 ```
 
-On first run, models are downloaded automatically (~16 GB total). Monitor progress:
+With native Ollama, `docker compose up -d` starts only the proxy and the Playwright browser.
 
-```bash
-docker compose logs -f yk_model_init
-```
-
-Once `yk_model_init` exits, `yk_copilot` starts automatically.
+If the build fails with `UNABLE_TO_VERIFY_LEAF_SIGNATURE`, your network intercepts TLS (a corporate proxy or some antivirus suites). Set `NPM_STRICT_SSL=false` in `.env` and rebuild.
 
 ## Register the yk-copilot command
 
-Run once to add `yk-copilot on/off` to any terminal:
-
-**Mac / Linux**
 ```bash
-bash scripts/install.sh
+bash scripts/install.sh      # Mac / Linux
 ```
-
-**Windows (PowerShell)**
 ```powershell
-.\scripts\install.ps1
+.\scripts\install.ps1        # Windows
 ```
 
-Open a new terminal after running the installer.
-
-## Switch between local and cloud
+Open a new terminal afterwards.
 
 ```bash
-yk-copilot on      # Claude Code uses local models (free)
-yk-copilot off     # Claude Code uses api.anthropic.com
-yk-copilot status  # show current mode
+yk-copilot on      # start the stack, point Claude Code at local models
+yk-copilot off     # back to api.anthropic.com
+yk-copilot status  # current mode + Ollama and proxy health
+yk-copilot test    # run the smoke test
+yk-copilot logs    # follow proxy logs
 ```
 
-Both commands also update VS Code `settings.json` automatically.
-After switching, reload the VS Code window: `Ctrl+Shift+P` > `Reload Window`.
+`on` and `off` persist the environment variables at user scope, so new terminals pick up the change. Both also update VS Code `settings.json` — reload the window afterwards.
 
-## Models
+## Keep your MCP servers small
 
-| Model | Size | Role |
+This will bite you, and it does not look like a context problem when it does.
+
+Every MCP tool definition is re-sent on every request and is charged against the context window before the model reads your question. Measured here: Claude Code's own 27 tools compress to about 5,700 tokens — but with the MCP servers from a real project attached, the same request carried **95 tools and 20,400 tokens**, filling a 24k window entirely. The model answered with confused prose and nothing worked, with no error to explain why.
+
+Use a small, per-task `.mcp.json` when coding against a local model:
+
+```bash
+claude --mcp-config .mcp.json --strict-mcp-config
+```
+
+`--strict-mcp-config` makes Claude Code ignore your global servers and use only that file. There is an example in [examples/mcp.json](examples/mcp.json).
+
+`ollos` pairs well with local coding: it transcribes audio and reads text off screenshots and video frames, returning text, so nothing else has to fit in VRAM next to the code model.
+
+## Tuning
+
+Everything here is set in `.env` and read at startup.
+
+| Variable | Default | What it does |
 |---|---|---|
-| `qwen2.5-coder:7b` | ~4.7 GB | Fast responses, simple tasks |
-| `qwen2.5-coder:14b` | ~9 GB | Complex tasks, tool use, long context |
-| `gemma4:e4b` | ~2.5 GB | Vision: describes images sent by Claude Code |
+| `NUM_CTX` | `24576` | Context window. Ollama's own default is 4096, which silently truncates Claude Code's prompt before the model sees your request. Do not go below 16384. |
+| `TOOL_DESC_LIMIT` | `400` | Max characters per tool description. Cuts the tool schemas by ~75%. |
+| `ARG_DESC_LIMIT` | `120` | Max characters per parameter description. |
+| `SYSTEM_LIMIT` | `8000` | Max characters of the host system prompt, keeping the opening and the closing. Without this a 7B model answers in prose instead of calling the next tool. |
+| `SNAPSHOT_LIMIT` | `4000` | Max characters of a web page handed to the model. |
+| `BROWSER_TOOLS` | `0` | Offer the proxy's own Playwright search tools. Off because Claude Code has its own, and offering both made the model spend six turns searching the web for a `flatten` function. Set to `1` when something other than Claude Code calls this API. |
+| `MODEL_FAST` | `qwen2.5:7b` | Short requests with no tools. |
+| `MODEL_SMART` | `qwen2.5:7b` | Everything Claude Code sends. |
+| `MODEL_VISION` | `gemma3:4b` | Describes images for the code model. |
 
-Edit `MODEL_FAST`, `MODEL_SMART`, `MODEL_VISION` in `.env` to swap models.
-
-## GPU acceleration (optional)
-
-By default Ollama runs inside Docker on CPU. For faster inference with a GPU:
-
-**Mac / Windows** - install [Ollama](https://ollama.com) natively, then set in `.env`:
-```
-OLLAMA_API_URL=http://host.docker.internal:11434
-```
-
-**Linux** - add to the `yk_ollama` service in `docker-compose.yml`:
-```yaml
-deploy:
-  resources:
-    reservations:
-      devices:
-        - driver: nvidia
-          count: all
-          capabilities: [gpu]
-```
-
-Restart with `docker compose up -d` after any `.env` change.
+Raise `TOOL_DESC_LIMIT` and `SYSTEM_LIMIT` if the model misuses a tool; lower `NUM_CTX` to 16384 if you run out of VRAM.
 
 ## Smoke test
-
-Verify everything works before switching Claude Code to local mode:
 
 ```bash
 node scripts/test.js --wait
 ```
 
-Runs 12 checks: proxy, dashboard, models, streaming, tool calling, vision pipeline, web search, and complex coding prompts.
+Twelve checks: proxy, dashboard, models, streaming, tool calling, multi-turn tool results, vision pipeline, web search, and a real coding prompt. Run it before switching Claude Code over — it fails loudly where a misconfigured stack fails silently.
+
+## What to expect
+
+Two tasks, same machine, to calibrate:
+
+- *"Edit calc.py so divide raises ValueError when b is zero"* — done correctly in 18s
+- *"Add subtract, write unit tests for all three functions, run them"* — the 30B completed it in **3.5 minutes**: function added, four tests written, tests executed and passing, verified independently afterwards. A 7B failed the same task twice, once by narrating without acting and once by reporting a test run that never happened.
+
+A few minutes for something a frontier model does in one is the real trade. It is not free of supervision either — check that files changed rather than trusting the summary, because a local model's worst failure is a confident report of work it never did. But it runs with the network off and costs nothing.
 
 ## Commands
 
 ```bash
-docker compose logs -f yk_copilot     # proxy logs
-docker compose logs -f yk_model_init  # model download progress
+docker compose logs -f yk_copilot     # proxy logs, including compression stats
 docker compose ps                     # container status
 docker compose down                   # stop
-docker compose down -v                # stop and delete all data (including models)
+ollama ps                             # what is loaded in VRAM, and on GPU or CPU
 ```
 
 ---

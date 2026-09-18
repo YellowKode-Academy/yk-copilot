@@ -65,12 +65,12 @@ async function waitForProxy(maxMs = 120000) {
   return false;
 }
 
-async function sendMessage({ messages, tools, stream = false }) {
+async function sendMessage({ messages, tools, stream = false, maxTokens = 256 }) {
   const r = await fetch(`${BASE}/v1/messages`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'x-api-key': 'ollama', 'anthropic-version': '2023-06-01' },
-    body: JSON.stringify({ model: 'claude-sonnet-4-6', max_tokens: 256, stream, messages, tools }),
-    signal: AbortSignal.timeout(120000),
+    body: JSON.stringify({ model: 'claude-sonnet-4-6', max_tokens: maxTokens, stream, messages, tools }),
+    signal: AbortSignal.timeout(300000),
   });
   if (!r.ok) throw new Error(`HTTP ${r.status}: ${await r.text()}`);
 
@@ -241,6 +241,9 @@ async function run() {
         role: 'user',
         content: 'Write a Python function called `flatten` that takes a nested list of any depth and returns a flat list. Include a docstring and handle edge cases.',
       }],
+      // A larger model explains its plan before writing the code; 256 tokens cuts it
+      // off before the function ever appears.
+      maxTokens: 1200,
     });
     const text = msg.content?.find(c => c.type === 'text')?.text || '';
     const hasCode   = text.includes('def flatten') || text.includes('def ');

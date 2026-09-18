@@ -1,35 +1,60 @@
 services:
   yk_copilot:
-    build: .
+    build:
+      context: .
+      args:
+        # Set NPM_STRICT_SSL=false in .env on a network that intercepts TLS
+        NPM_STRICT_SSL: ${NPM_STRICT_SSL:-true}
     container_name: yk_copilot
     restart: unless-stopped
     ports:
       - "${PROXY_PORT:-9999}:9999"
     environment:
-      - OLLAMA_API_URL=${OLLAMA_API_URL:-http://yk_ollama:11434}
+      - OLLAMA_API_URL=${OLLAMA_API_URL:-http://host.docker.internal:11434}
       - PLAYWRIGHT_MCP_URL=http://yk_playwright:8931
       - MODEL_FAST=${MODEL_FAST:-qwen2.5-coder:7b}
-      - MODEL_SMART=${MODEL_SMART:-qwen2.5-coder:14b}
+      - MODEL_SMART=${MODEL_SMART:-qwen2.5-coder:7b}
       - MODEL_VISION=${MODEL_VISION:-gemma4:e4b}
+      - NUM_CTX=${NUM_CTX:-24576}
+      - TOOL_DESC_LIMIT=${TOOL_DESC_LIMIT:-400}
+      - ARG_DESC_LIMIT=${ARG_DESC_LIMIT:-120}
+      - SYSTEM_LIMIT=${SYSTEM_LIMIT:-8000}
+      - SNAPSHOT_LIMIT=${SNAPSHOT_LIMIT:-4000}
+      - BROWSER_TOOLS=${BROWSER_TOOLS:-0}
       - PROXY_PORT=9999
+    # No depends_on for yk_ollama / yk_model_init on purpose: those only exist in the
+    # with-ollama profile, and Compose would silently enable the profile to satisfy a
+    # dependency, starting a second CPU-only Ollama next to a native GPU one.
     depends_on:
-      yk_model_init:
-        condition: service_completed_successfully
       yk_playwright:
         condition: service_healthy
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:9999/health"]   # not localhost: resolves to ::1 in the container
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
     networks:
       - yk_copilot_net
 
+  # ── Ollama in a container: CPU-only on Mac/Windows ──────────────────────────
+  # Only started with: docker compose --profile with-ollama up -d
+  # On a machine with an NVIDIA GPU, install Ollama natively instead — Docker
+  # Desktop does not pass the GPU through, and a 7B model on CPU is ~10x slower.
   yk_ollama:
     image: ollama/ollama
     container_name: yk_ollama
+    profiles: ["with-ollama"]
     restart: unless-stopped
+    ports:
+      - "${OLLAMA_PORT:-11434}:11434"
     volumes:
       - yk_ollama_data:/root/.ollama
     environment:
       - OLLAMA_KEEP_ALIVE=24h
+      - OLLAMA_FLASH_ATTENTION=1
     networks:
       - yk_copilot_net
     healthcheck:
@@ -38,14 +63,23 @@ services:
       timeout: 5s
       retries: 15
       start_period: 15s
+    # Linux + NVIDIA only — uncomment to pass the GPU into the container:
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
 
   yk_model_init:
     image: ollama/ollama
     container_name: yk_model_init
+    profiles: ["with-ollama"]
     environment:
       - OLLAMA_HOST=http://yk_ollama:11434
       - MODEL_FAST=${MODEL_FAST:-qwen2.5-coder:7b}
-      - MODEL_SMART=${MODEL_SMART:-qwen2.5-coder:14b}
+      - MODEL_SMART=${MODEL_SMART:-qwen2.5-coder:7b}
       - MODEL_VISION=${MODEL_VISION:-gemma4:e4b}
     volumes:
       - ./scripts/model-init.sh:/model-init.sh:ro

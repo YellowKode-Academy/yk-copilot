@@ -1,0 +1,23 @@
+{
+  "_comment": [
+    "Example .mcp.json for a project you code on with yk-copilot. Copy it to the root",
+    "of that project as .mcp.json.",
+    "",
+    "Every MCP tool definition is re-sent on every single request, so the tool list is",
+    "charged against NUM_CTX before the model reads a word of your actual question. A",
+    "server exposing hundreds of tools fills a 32k window on its own and leaves nothing",
+    "for the conversation. Against a local model, keep this file to the servers the task",
+    "actually needs — that is the whole rule.",
+    "",
+    "ollos gives the model eyes and ears locally: it transcribes audio, reads text off",
+    "screenshots and video frames, and diffs frames. Unlike MODEL_VISION in the proxy, it",
+    "returns text, so nothing has to fit in VRAM alongside the code model."
+  ],
+
+  "mcpServers": {
+    "ollos": {
+      "command": "C:/Users/kelvi/AppData/Roaming/npm/ollos-mcp.cmd",
+      "args": []
+    }
+  }
+}
