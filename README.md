@@ -134,7 +134,9 @@ bash scripts/install.sh      # Mac / Linux
 .\scripts\install.ps1        # Windows
 ```
 
-Open a new terminal afterwards.
+Open a new terminal afterwards. On Windows the installer covers both shells: it
+registers a function in your PowerShell profile and drops a `yk-copilot.cmd` on your
+PATH, since `cmd.exe` cannot see a PowerShell function.
 
 ```bash
 yk-copilot on      # start the stack, point Claude Code at local models

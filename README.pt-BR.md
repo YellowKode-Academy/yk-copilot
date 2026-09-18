@@ -134,7 +134,9 @@ bash scripts/install.sh      # Mac / Linux
 .\scripts\install.ps1        # Windows
 ```
 
-Abra um terminal novo depois.
+Abra um terminal novo depois. No Windows o instalador cobre os dois shells: registra
+uma função no seu perfil do PowerShell e coloca um `yk-copilot.cmd` no PATH, porque
+o `cmd.exe` não enxerga função de PowerShell.
 
 ```bash
 yk-copilot on      # sobe a stack e aponta o Claude Code para os modelos locais

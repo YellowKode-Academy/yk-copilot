@@ -11,6 +11,21 @@ if (-not (Test-Path $Profile)) {
   New-Item -ItemType File -Path $Profile -Force | Out-Null
 }
 
+# cmd.exe cannot see a PowerShell function, so install a .cmd wrapper on the PATH
+# for anyone working there.
+$CmdSrc = "$YkDir\scripts\yk-copilot.cmd"
+$CmdDir = "$env:USERPROFILE\.localin"
+if (Test-Path $CmdSrc) {
+  if (-not (Test-Path $CmdDir)) { New-Item -ItemType Directory -Force -Path $CmdDir | Out-Null }
+  Copy-Item $CmdSrc $CmdDir -Force
+  $userPath = [Environment]::GetEnvironmentVariable('PATH', 'User')
+  if ($userPath -notlike "*$CmdDir*") {
+    [Environment]::SetEnvironmentVariable('PATH', "$userPath;$CmdDir", 'User')
+    Write-Host "[yk] added $CmdDir to your PATH (for cmd.exe)"
+  }
+  Write-Host "[yk] cmd wrapper installed at $CmdDir\yk-copilot.cmd"
+}
+
 $content = Get-Content $Profile -Raw -ErrorAction SilentlyContinue
 
 $line1 = "`$env:YK_DIR = `"$YkDir`""
