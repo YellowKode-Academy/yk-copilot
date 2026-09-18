@@ -22,6 +22,8 @@ services:
       - SNAPSHOT_LIMIT=${SNAPSHOT_LIMIT:-4000}
       - BROWSER_TOOLS=${BROWSER_TOOLS:-0}
       - TOOL_BUDGET=${TOOL_BUDGET:-0.35}
+      - TOOL_PRIORITY=${TOOL_PRIORITY:-}
+      - DEBUG_TOOLS=${DEBUG_TOOLS:-}
       - DEBUG_FIND=${DEBUG_FIND:-}
       - PROXY_PORT=9999
     # No depends_on for yk_ollama / yk_model_init on purpose: those only exist in the

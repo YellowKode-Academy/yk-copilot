@@ -49,6 +49,10 @@ const BROWSER_TOOLS_ENABLED = process.env.BROWSER_TOOLS === '1';
 // does not surface as a context error — the runner dies and the chat reports a
 // dropped connection, which looks like a broken install.
 const TOOL_BUDGET = Number(process.env.TOOL_BUDGET || 0.35);
+// Comma-separated fragments of tool names to keep ahead of everything else, for when
+// a particular MCP server matters more than the ranking would guess.
+const TOOL_PRIORITY = (process.env.TOOL_PRIORITY || '')
+  .split(',').map(x => x.trim().toLowerCase()).filter(Boolean);
 
 // ─── Playwright MCP client ────────────────────────────────────────────────────
 
@@ -287,6 +291,20 @@ function simpleHash(str) {
   return (h >>> 0).toString(36);
 }
 
+// The newest user message: the request being answered, as opposed to the one that
+// opened the session.
+function lastUserText(messages) {
+  for (let i = (messages || []).length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (m.role !== 'user') continue;
+    const c = Array.isArray(m.content)
+      ? m.content.filter(x => x.type === 'text').map(x => x.text).join(' ')
+      : (m.content || '');
+    if (c) return c.slice(0, 500);
+  }
+  return '';
+}
+
 function firstUserText(messages) {
   for (const m of messages) {
     if (m.role !== 'user') continue;
@@ -471,24 +489,87 @@ function toOllamaTools(tools) {
 // model's own file and shell tools are what make it able to code at all, so those go
 // in first and MCP tools fill whatever room is left. Losing an MCP tool costs a
 // capability; losing Edit costs everything.
-function fitToolBudget(tools) {
+// Words worth matching on: long enough to mean something, and not the filler that
+// turns up in every request, in either language.
+const STOPWORDS = new Set([
+  'the','and','for','with','that','this','from','have','what','when','which','there',
+  'please','could','would','about','into','your','you','are','can','get','use','using',
+  'para','que','como','uma','dos','das','por','com','mais','meu','minha','pode','fazer',
+  'tenho','temos','quero','sobre','favor','entao','ultimos','estao','analisa','mesmo',
+]);
+
+function terms(text) {
+  return new Set(
+    (text || '').toLowerCase()
+      .split(/[^a-z0-9\u00e0-\u00ff]+/)
+      .filter(w => w.length > 3 && !STOPWORDS.has(w))
+  );
+}
+
+// How well a tool matches what was asked. The name carries far more signal than the
+// description, which is long and mostly shared boilerplate.
+function relevance(tool, wanted) {
+  if (!wanted.size) return 0;
+  const name = tool.function.name.toLowerCase();
+  const desc = (tool.function.description || '').toLowerCase().slice(0, 300);
+  let score = 0;
+  for (const w of wanted) {
+    if (name.includes(w)) { score += 10; continue; }
+    // Tool names are English; the request often is not. A shared prefix catches the
+    // cognates that carry most of the signal here — transcrever/transcribe,
+    // audio/audio, imagem/image — without pretending to be translation.
+    const stem = w.slice(0, 6);
+    if (stem.length >= 5 && name.includes(stem)) { score += 6; continue; }
+    if (desc.includes(w)) score += 1;
+  }
+  return score;
+}
+
+// Which tier a tool belongs to. Lower sorts first.
+//
+// Tier 0 — the model's own file and shell tools. Losing an MCP tool costs one
+//   capability; losing Edit costs the ability to code at all.
+// Tier 1 — anything named in TOOL_PRIORITY, for when you want a specific server kept.
+// Tier 2 — MCP servers from the project's own .mcp.json. You put them there on
+//   purpose, so they outrank the rest.
+// Tier 3 — connectors attached to the claude.ai account. The VS Code extension loads
+//   all of them whether or not the project asked for any, and they are what blows
+//   past the budget in the first place.
+function toolTier(name) {
+  if (!name.startsWith('mcp__')) return 0;
+  const lower = name.toLowerCase();
+  if (TOOL_PRIORITY.some(p => lower.includes(p))) return 1;
+  if (lower.startsWith('mcp__claude_ai_')) return 3;
+  return 2;
+}
+
+// When the schemas cannot fit, drop tools rather than let the request fail. Within a
+// tier, tools compete on how well they match the request: ask about Instagram posts
+// and the Instagram tools get the room, instead of whichever happened to be listed
+// first.
+function fitToolBudget(tools, askedFor) {
   const budget = Math.floor(NUM_CTX * TOOL_BUDGET) * 4;   // ~4 chars per token
   const size = (t) => JSON.stringify(t).length;
   const total = tools.reduce((n, t) => n + size(t), 0);
-  if (total <= budget) return { tools, dropped: 0, total };
+  if (total <= budget) return { tools, dropped: 0, total, ranked: false, byTier: null };
 
-  const core = tools.filter(t => !t.function.name.startsWith('mcp__'));
-  const mcp  = tools.filter(t =>  t.function.name.startsWith('mcp__'));
+  const wanted = terms(askedFor);
+  const ordered = tools
+    .map(t => ({ t, tier: toolTier(t.function.name), score: relevance(t, wanted) }))
+    .sort((a, b) => a.tier - b.tier || b.score - a.score);
 
   const kept = [];
   let used = 0;
-  for (const t of [...core, ...mcp]) {
+  for (const { t } of ordered) {
     const n = size(t);
     if (used + n > budget && kept.length) continue;
     kept.push(t);
     used += n;
   }
-  return { tools: kept, dropped: tools.length - kept.length, total: used };
+
+  const byTier = [0, 0, 0, 0];
+  for (const t of kept) byTier[toolTier(t.function.name)]++;
+  return { tools: kept, dropped: tools.length - kept.length, total: used, ranked: wanted.size > 0, byTier };
 }
 
 // Small models frequently narrate a tool call as text instead of using the native
@@ -720,10 +801,11 @@ async function runAgentLoop(body, res) {
   const model       = selectModel(cleanBody);
   const claudeTools = toOllamaTools(cleanBody.tools);
   const offered     = BROWSER_TOOLS_ENABLED ? [...claudeTools, ...BROWSER_TOOLS] : claudeTools;
-  const budgeted    = fitToolBudget(offered);
+  // Rank against the newest user message — that is the request being answered now.
+  const budgeted    = fitToolBudget(offered, lastUserText(cleanBody.messages));
   const allTools    = budgeted.tools;
   if (budgeted.dropped) {
-    console.warn(`[tools] ${offered.length} tools exceeded the context budget; kept ${allTools.length}, dropped ${budgeted.dropped} (MCP first). Raise NUM_CTX or attach fewer MCP servers.`);
+    console.warn(`[tools] ${offered.length} offered exceeds the budget; kept ${allTools.length} [core ${budgeted.byTier[0]}, priority ${budgeted.byTier[1]}, project-mcp ${budgeted.byTier[2]}, account-mcp ${budgeted.byTier[3]}]${budgeted.ranked ? ', ranked by relevance' : ''}; dropped ${budgeted.dropped}.`);
   }
   const knownNames  = new Set(allTools.map(t => t.function.name));
   const history     = toOllamaMessages(cleanBody, allTools);
@@ -732,6 +814,10 @@ async function runAgentLoop(body, res) {
     const before = JSON.stringify(cleanBody.tools).length;
     const after  = JSON.stringify(allTools).length;
     console.log(`[tools] ${cleanBody.tools.length} offered -> ${allTools.length} sent, schema ${Math.round(before / 1024)}KB -> ${Math.round(after / 1024)}KB (~${Math.round(after / 4)} tokens)`);
+    // DEBUG_TOOLS=1 prints which tools survived, in the order they were ranked.
+    if (process.env.DEBUG_TOOLS === '1') {
+      console.log('[tools] kept: ' + allTools.map(t => t.function.name).join(', '));
+    }
   }
 
   const visionInject = visionDescription

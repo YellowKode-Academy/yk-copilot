@@ -154,7 +154,24 @@ This will bite you, and it does not look like a context problem when it does.
 
 Every MCP tool definition is re-sent on every request and is charged against the context window before the model reads your question. Measured here: Claude Code's own 27 tools compress to about 5,700 tokens — but with the MCP servers from a real project attached, the same request carried **95 tools and 20,400 tokens**, filling a 24k window entirely. The model answered with confused prose and nothing worked, with no error to explain why.
 
-Use a small, per-task `.mcp.json` when coding against a local model:
+The proxy does not just fail when this happens. Tools are ranked and the ones that do
+not fit are dropped, in this order:
+
+1. the model's own file and shell tools — losing `Edit` costs the ability to code at all
+2. anything named in `TOOL_PRIORITY`
+3. MCP servers from the project's own `.mcp.json` — you put them there on purpose
+4. connectors attached to the claude.ai account, which the extension loads whether the
+   project asked for them or not
+
+Within a tier, tools compete on how well they match the request. Ask about Instagram
+posts and the Instagram tools get the room; ask to transcribe a video and the
+transcription tools do. Matching is lexical, with a shared-prefix rule for cognates
+(*transcrever* → `transcribe`), so it works across languages for related words and not
+for unrelated ones — *navegador* will not find `browser`.
+
+That keeps a large server usable, but it is a rescue, not a plan. A server exposing
+200+ tools still crowds out everything else on a 24k window. Prefer a small, per-task
+`.mcp.json` when coding against a local model:
 
 ```bash
 claude --mcp-config .mcp.json --strict-mcp-config
@@ -173,8 +190,9 @@ Everything here is set in `.env` and read at startup.
 | `NUM_CTX` | `24576` | Context window. Ollama's own default is 4096, which silently truncates Claude Code's prompt before the model sees your request. Do not go below 16384. |
 | `TOOL_DESC_LIMIT` | `400` | Max characters per tool description. Cuts the tool schemas by ~75%. |
 | `ARG_DESC_LIMIT` | `120` | Max characters per parameter description. |
-| `SYSTEM_LIMIT` | `8000` | Max characters of the host system prompt, keeping the opening and the closing. Without this a 7B model answers in prose instead of calling the next tool. |
+| `SYSTEM_LIMIT` | `8000` | Max characters of the host system prompt, keeping the opening and the closing. Without this a 7B model answers in prose instead of calling the next tool. Your `CLAUDE.md` is unaffected: Claude Code sends it inside the messages, not the system prompt. |
 | `SNAPSHOT_LIMIT` | `4000` | Max characters of a web page handed to the model. |
+| `TOOL_PRIORITY` | *(empty)* | Comma-separated fragments of tool names to keep ahead of everything else, e.g. `ollos,playwright`. |
 | `TOOL_BUDGET` | `0.35` | Share of `NUM_CTX` the tool schemas may take. Past it, tools are dropped — MCP ones first, the model's own file and shell tools last. Without this the VS Code extension's 334 tools (~69k tokens) kill the runner, and the chat shows a dropped connection rather than anything about context. |
 | `BROWSER_TOOLS` | `0` | Offer the proxy's own Playwright search tools. Off because Claude Code has its own, and offering both made the model spend six turns searching the web for a `flatten` function. Set to `1` when something other than Claude Code calls this API. |
 | `MODEL_FAST` | `qwen2.5:7b` | Short requests with no tools. |

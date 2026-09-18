@@ -154,7 +154,25 @@ Isso vai te pegar, e quando pega não parece um problema de contexto.
 
 Cada definição de ferramenta de MCP é reenviada em toda requisição e é cobrada da janela de contexto antes do modelo ler sua pergunta. Medido aqui: as 27 ferramentas do próprio Claude Code comprimem para cerca de 5.700 tokens — mas com os MCP servers de um projeto real anexados, a mesma requisição carregou **95 ferramentas e 20.400 tokens**, enchendo uma janela de 24k inteira. O modelo respondeu com um texto confuso e nada funcionou, sem nenhum erro que explicasse o porquê.
 
-Use um `.mcp.json` pequeno e específico da tarefa ao codar contra um modelo local:
+O proxy não simplesmente falha quando isso acontece. As ferramentas são ordenadas e as
+que não couberem são descartadas, nesta ordem:
+
+1. as ferramentas de arquivo e shell do próprio modelo — perder o `Edit` custa a
+   capacidade de programar
+2. o que estiver em `TOOL_PRIORITY`
+3. os MCP do `.mcp.json` do projeto — você colocou ali de propósito
+4. os conectores da conta claude.ai, que a extensão carrega tendo o projeto pedido ou não
+
+Dentro de cada nível, as ferramentas competem por quanto combinam com o pedido.
+Pergunte sobre posts do Instagram e as ferramentas de Instagram ficam com o espaço;
+peça para transcrever um vídeo e as de transcrição ficam. O casamento é lexical, com
+uma regra de prefixo comum para cognatos (*transcrever* → `transcribe`), então funciona
+entre idiomas para palavras aparentadas e não para as outras — *navegador* não acha
+`browser`.
+
+Isso mantém um servidor grande utilizável, mas é um resgate, não um plano. Um servidor
+com 200+ ferramentas ainda sufoca o resto numa janela de 24k. Prefira um `.mcp.json`
+pequeno e específico da tarefa ao codar contra um modelo local:
 
 ```bash
 claude --mcp-config .mcp.json --strict-mcp-config
@@ -173,8 +191,9 @@ Tudo aqui fica no `.env` e é lido na inicialização.
 | `NUM_CTX` | `24576` | Janela de contexto. O padrão do Ollama é 4096, que trunca em silêncio o prompt do Claude Code antes do modelo ver seu pedido. Não desça abaixo de 16384. |
 | `TOOL_DESC_LIMIT` | `400` | Máximo de caracteres por descrição de ferramenta. Corta os schemas em ~75%. |
 | `ARG_DESC_LIMIT` | `120` | Máximo de caracteres por descrição de parâmetro. |
-| `SYSTEM_LIMIT` | `8000` | Máximo de caracteres do system prompt do host, mantendo o começo e o fim. Sem isso, um modelo 7B responde em prosa em vez de chamar a próxima ferramenta. |
+| `SYSTEM_LIMIT` | `8000` | Máximo de caracteres do system prompt do host, mantendo o começo e o fim. Sem isso, um modelo 7B responde em prosa em vez de chamar a próxima ferramenta. Seu `CLAUDE.md` não é afetado: o Claude Code manda ele dentro das mensagens, não no system prompt. |
 | `SNAPSHOT_LIMIT` | `4000` | Máximo de caracteres de uma página web entregue ao modelo. |
+| `TOOL_PRIORITY` | *(vazio)* | Fragmentos de nomes de ferramenta, separados por vírgula, que ficam na frente de tudo, ex.: `ollos,playwright`. |
 | `TOOL_BUDGET` | `0.35` | Fatia do `NUM_CTX` que os schemas de ferramenta podem ocupar. Passando disso, ferramentas são descartadas — as de MCP primeiro, as de arquivo e shell do modelo por último. Sem isso, as 334 ferramentas da extensão do VS Code (~69k tokens) matam o runner, e o chat mostra uma conexão derrubada em vez de qualquer coisa sobre contexto. |
 | `BROWSER_TOOLS` | `0` | Oferece as ferramentas de busca Playwright do proxy. Desligado porque o Claude Code tem as dele, e oferecer as duas fez o modelo gastar seis turnos procurando na web uma função `flatten`. Ponha `1` se algo que não seja o Claude Code usar esta API. |
 | `MODEL_FAST` | `qwen2.5:7b` | Requisições curtas, sem ferramentas. |
