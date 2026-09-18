@@ -13,6 +13,10 @@ if (-not (Test-Path $Profile)) {
 
 # cmd.exe cannot see a PowerShell function, so install a .cmd wrapper on the PATH
 # for anyone working there.
+# The wrapper is copied onto the PATH, where it can no longer locate the project
+# from its own path, so record where it lives.
+[Environment]::SetEnvironmentVariable('YK_DIR', $YkDir, 'User')
+
 $CmdSrc = "$YkDir\scripts\yk-copilot.cmd"
 $CmdDir = "$env:USERPROFILE\.localin"
 if (Test-Path $CmdSrc) {

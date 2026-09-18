@@ -27,23 +27,7 @@ yk-copilot() {
     local ACTION="$1"
     [ -f "$VS_SETTINGS" ] || return
     command -v node &>/dev/null || return
-    node - "$VS_SETTINGS" "$ACTION" "$PROXY" <<'JSEOF'
-const fs = require('fs');
-const [,, settingsPath, action, proxy] = process.argv;
-try {
-  const s = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
-  if (action === 'on') {
-    s['claude.apiBaseUrl'] = proxy;
-    s['claude.apiKey']     = 'ollama';
-  } else {
-    delete s['claude.apiBaseUrl'];
-    delete s['claude.apiKey'];
-  }
-  fs.writeFileSync(settingsPath, JSON.stringify(s, null, 2) + '\n');
-} catch (e) {
-  console.log('[yk] Could not update VS Code settings: ' + e.message);
-}
-JSEOF
+    node "$DIR/scripts/vscode-toggle.js" "$VS_SETTINGS" "$ACTION" "$PROXY"
   }
 
   case "$MODE" in

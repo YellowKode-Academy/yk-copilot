@@ -22,27 +22,7 @@ function yk-copilot {
   function Update-VsCode([string]$Action) {
     if (-not (Test-Path $VsSettings)) { return }
     if (-not (Get-Command node -ErrorAction SilentlyContinue)) { return }
-    $js = @"
-const fs = require('fs');
-const [,, settingsPath, action, proxy] = process.argv;
-try {
-  const s = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
-  if (action === 'on') {
-    s['claude.apiBaseUrl'] = proxy;
-    s['claude.apiKey']     = 'ollama';
-  } else {
-    delete s['claude.apiBaseUrl'];
-    delete s['claude.apiKey'];
-  }
-  fs.writeFileSync(settingsPath, JSON.stringify(s, null, 2) + '\n');
-} catch (e) {
-  console.log('[yk] Could not update VS Code settings: ' + e.message);
-}
-"@
-    $tmp = [System.IO.Path]::GetTempFileName() -replace '\.tmp$', '.js'
-    $js | Out-File -Encoding utf8 -FilePath $tmp
-    node $tmp $VsSettings $Action $Proxy
-    Remove-Item $tmp -ErrorAction SilentlyContinue
+    node "$Dir\scriptsscode-toggle.js" $VsSettings $Action $Proxy
   }
 
   # Persist at User scope so new terminals and the VS Code extension pick it up too,
