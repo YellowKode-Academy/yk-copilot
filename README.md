@@ -146,7 +146,7 @@ yk-copilot test    # run the smoke test
 yk-copilot logs    # follow proxy logs
 ```
 
-`on` and `off` persist the environment variables at user scope, so new terminals pick up the change. Both also update VS Code `settings.json` — reload the window afterwards.
+`on` and `off` persist the environment variables at user scope, so new terminals pick up the change. They also write `claudeCode.environmentVariables` into VS Code's `settings.json`, which is what the extension actually reads — it does not inherit your shell's environment. **Reload the VS Code window afterwards** (`Ctrl+Shift+P` > `Reload Window`), or the extension quietly keeps using the cloud, and the only sign is the model name in the corner of the chat panel.
 
 ## Keep your MCP servers small
 
