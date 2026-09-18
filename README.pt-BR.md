@@ -146,6 +146,13 @@ yk-copilot test    # roda o smoke test
 yk-copilot logs    # acompanha os logs do proxy
 ```
 
+Eles também colocam `claudeCode.initialPermissionMode` em `acceptEdits`. O modo
+**Auto** da extensão pergunta a um modelo do lado da Anthropic se um comando é seguro
+de rodar, e contra um proxy local esse modelo não existe — aí todo comando de shell
+falha com *"claude-opus-5 is temporarily unavailable, so auto mode cannot determine
+the safety of Bash"*. O `acceptEdits` aprova edições de arquivo localmente e pergunta
+a você sobre comandos de shell.
+
 `on` e `off` gravam as variáveis de ambiente no escopo do usuário, então terminais novos já pegam a mudança. Eles também escrevem `claudeCode.environmentVariables` no `settings.json` do VS Code, que é o que a extensão realmente lê — ela não herda o ambiente do seu shell. **Recarregue a janela do VS Code depois** (`Ctrl+Shift+P` > `Reload Window`), senão a extensão continua na nuvem em silêncio, e o único sinal disso é o nome do modelo no canto do painel de chat.
 
 ## Mantenha seus MCP servers enxutos
@@ -193,6 +200,7 @@ Tudo aqui fica no `.env` e é lido na inicialização.
 | `ARG_DESC_LIMIT` | `120` | Máximo de caracteres por descrição de parâmetro. |
 | `SYSTEM_LIMIT` | `8000` | Máximo de caracteres do system prompt do host, mantendo o começo e o fim. Sem isso, um modelo 7B responde em prosa em vez de chamar a próxima ferramenta. Seu `CLAUDE.md` não é afetado: o Claude Code manda ele dentro das mensagens, não no system prompt. |
 | `SNAPSHOT_LIMIT` | `4000` | Máximo de caracteres de uma página web entregue ao modelo. |
+| `RESULT_LIMIT` | `6000` | Máximo de caracteres guardados de um resultado de ferramenta. Uma listagem de diretório ou uma página de log já é ruído no turno seguinte. |
 | `TOOL_PRIORITY` | *(vazio)* | Fragmentos de nomes de ferramenta, separados por vírgula, que ficam na frente de tudo, ex.: `ollos,playwright`. |
 | `TOOL_BUDGET` | `0.35` | Fatia do `NUM_CTX` que os schemas de ferramenta podem ocupar. Passando disso, ferramentas são descartadas — as de MCP primeiro, as de arquivo e shell do modelo por último. Sem isso, as 334 ferramentas da extensão do VS Code (~69k tokens) matam o runner, e o chat mostra uma conexão derrubada em vez de qualquer coisa sobre contexto. |
 | `BROWSER_TOOLS` | `0` | Oferece as ferramentas de busca Playwright do proxy. Desligado porque o Claude Code tem as dele, e oferecer as duas fez o modelo gastar seis turnos procurando na web uma função `flatten`. Ponha `1` se algo que não seja o Claude Code usar esta API. |

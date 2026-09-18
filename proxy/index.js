@@ -53,6 +53,9 @@ const TOOL_BUDGET = Number(process.env.TOOL_BUDGET || 0.35);
 // a particular MCP server matters more than the ranking would guess.
 const TOOL_PRIORITY = (process.env.TOOL_PRIORITY || '')
   .split(',').map(x => x.trim().toLowerCase()).filter(Boolean);
+// Largest single tool result to keep verbatim. A directory listing or a page of logs
+// can run to tens of thousands of characters and is mostly noise by the next turn.
+const RESULT_LIMIT = Number(process.env.RESULT_LIMIT || 6000);
 
 // ─── Playwright MCP client ────────────────────────────────────────────────────
 
@@ -425,7 +428,11 @@ function toOllamaMessages(body, allTools) {
           for (const tr of toolResults) {
             const content = Array.isArray(tr.content) ? tr.content.map(c => c.text || '').join('\n') : (typeof tr.content === 'string' ? tr.content : '');
             // Small models lose track of which result answers which call without this
-            out.push({ role: 'tool', tool_name: toolNames.get(tr.tool_use_id) || 'tool', content });
+            out.push({
+              role: 'tool',
+              tool_name: toolNames.get(tr.tool_use_id) || 'tool',
+              content: clip(content, RESULT_LIMIT),
+            });
           }
           continue;
         }
@@ -434,6 +441,33 @@ function toOllamaMessages(body, allTools) {
       } else {
         out.push({ role: 'user', content: msg.content || '' });
       }
+    }
+  }
+
+  // Every turn resends the whole conversation, so a long session eventually asks for
+  // more than the window holds. Ollama does not report that: the runner dies and the
+  // caller sees a dropped TCP connection. Drop the middle of the history instead,
+  // keeping the opening (the task) and the recent turns (where the work is).
+  const roomForHistory = Math.floor(NUM_CTX * (1 - TOOL_BUDGET) * 0.8) * 4;
+  const weight = (m) => JSON.stringify(m).length;
+  let historySize = out.reduce((n, m) => n + weight(m), 0);
+  if (historySize > roomForHistory && out.length > 4) {
+    const head = out.slice(0, 2);            // system, and the first user turn
+    const tail = [];
+    let used = head.reduce((n, m) => n + weight(m), 0);
+    for (let i = out.length - 1; i >= 2; i--) {
+      const w = weight(out[i]);
+      if (used + w > roomForHistory && tail.length) break;
+      tail.unshift(out[i]);
+      used += w;
+    }
+    const cut = out.length - head.length - tail.length;
+    if (cut > 0) {
+      console.warn(`[history] conversation exceeded the window; dropped ${cut} middle message(s), kept ${head.length + tail.length}`);
+      // A tool result must never arrive without the assistant turn that called it.
+      while (tail.length && tail[0].role === 'tool') tail.shift();
+      out.length = 0;
+      out.push(...head, { role: 'user', content: '[...earlier turns omitted to fit the context window...]' }, ...tail);
     }
   }
 

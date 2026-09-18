@@ -9,6 +9,13 @@ const [, , settingsPath, action, proxy] = process.argv;
 const KEY  = 'claudeCode.environmentVariables';
 const OURS = ['ANTHROPIC_BASE_URL', 'ANTHROPIC_API_KEY'];
 
+// The extension's Auto permission mode asks a model on Anthropic's side whether a
+// command is safe to run. Pointed at a local proxy there is no such model, so every
+// Bash call fails with "claude-opus-5 is temporarily unavailable, so auto mode cannot
+// determine the safety of Bash". acceptEdits approves file edits locally and asks
+// about shell commands, which needs nothing remote.
+const MODE_KEY = 'claudeCode.initialPermissionMode';
+
 // VS Code settings.json allows comments and trailing commas; JSON.parse does not.
 function parseJsonc(text) {
   let out = '', inStr = false, esc = false, line = false, block = false;
@@ -43,8 +50,11 @@ try {
       { name: 'ANTHROPIC_BASE_URL', value: proxy },
       { name: 'ANTHROPIC_API_KEY',  value: 'ollama' },
     ];
+    if (!s[MODE_KEY] || s[MODE_KEY] === 'default') s[MODE_KEY] = 'acceptEdits';
   } else {
     if (kept.length) s[KEY] = kept; else delete s[KEY];
+    // Only undo the one we set; leave a deliberate choice alone.
+    if (s[MODE_KEY] === 'acceptEdits') delete s[MODE_KEY];
   }
 
   fs.writeFileSync(settingsPath, JSON.stringify(s, null, 2) + '\n');
