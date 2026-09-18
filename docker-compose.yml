@@ -21,6 +21,7 @@ services:
       - SYSTEM_LIMIT=${SYSTEM_LIMIT:-8000}
       - SNAPSHOT_LIMIT=${SNAPSHOT_LIMIT:-4000}
       - BROWSER_TOOLS=${BROWSER_TOOLS:-0}
+      - DEBUG_FIND=${DEBUG_FIND:-}
       - PROXY_PORT=9999
     # No depends_on for yk_ollama / yk_model_init on purpose: those only exist in the
     # with-ollama profile, and Compose would silently enable the profile to satisfy a

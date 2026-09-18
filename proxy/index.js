@@ -349,6 +349,16 @@ function trimSystem(text) {
 function toOllamaMessages(body, allTools) {
   const out = [];
   const rawSystem = extractSystem(body);
+  // DEBUG_FIND=<text>: report where a string lands in the payload, to tell whether
+  // something the host sent is being lost to trimming.
+  if (process.env.DEBUG_FIND) {
+    const needle = process.env.DEBUG_FIND;
+    const inSys  = (rawSystem || '').includes(needle);
+    const kept   = (trimSystem(rawSystem) || '').includes(needle);
+    const inMsgs = JSON.stringify(body.messages || []).includes(needle);
+    const inTools= JSON.stringify(body.tools || []).includes(needle);
+    console.log(`[find] "${needle}" system=${inSys} (sobrevive ao corte=${kept}) mensagens=${inMsgs} tools=${inTools}`);
+  }
   const envSystem = trimSystem(rawSystem);
   if (rawSystem && envSystem !== rawSystem) {
     console.log(`[system] host prompt ${Math.round(rawSystem.length / 1024)}KB -> ${Math.round(envSystem.length / 1024)}KB`);
