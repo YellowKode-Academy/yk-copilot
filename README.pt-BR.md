@@ -146,7 +146,7 @@ yk-copilot test    # roda o smoke test
 yk-copilot logs    # acompanha os logs do proxy
 ```
 
-`on` e `off` gravam as variáveis de ambiente no escopo do usuário, então terminais novos já pegam a mudança. Os dois também atualizam o `settings.json` do VS Code — recarregue a janela depois.
+`on` e `off` gravam as variáveis de ambiente no escopo do usuário, então terminais novos já pegam a mudança. Eles também escrevem `claudeCode.environmentVariables` no `settings.json` do VS Code, que é o que a extensão realmente lê — ela não herda o ambiente do seu shell. **Recarregue a janela do VS Code depois** (`Ctrl+Shift+P` > `Reload Window`), senão a extensão continua na nuvem em silêncio, e o único sinal disso é o nome do modelo no canto do painel de chat.
 
 ## Mantenha seus MCP servers enxutos
 
