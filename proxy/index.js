@@ -56,6 +56,11 @@ const TOOL_PRIORITY = (process.env.TOOL_PRIORITY || '')
 // Largest single tool result to keep verbatim. A directory listing or a page of logs
 // can run to tens of thousands of characters and is mostly noise by the next turn.
 const RESULT_LIMIT = Number(process.env.RESULT_LIMIT || 6000);
+// A model that does not fit in VRAM lives partly in system RAM, and on a busy desktop
+// the runner occasionally gets killed mid-request. Ollama reports that as a dropped
+// TCP connection, then reloads the model on the next call — so the retry usually
+// succeeds where the first attempt died.
+const OLLAMA_RETRIES = Number(process.env.OLLAMA_RETRIES || 2);
 
 // ─── Playwright MCP client ────────────────────────────────────────────────────
 
@@ -765,7 +770,34 @@ function sseToolUse(res, calls, blockIndex, outputTokens) {
 
 // Streams from Ollama and reports text as it arrives. Returning only at the end
 // would leave Claude Code staring at a blank screen for minutes on a local model.
-async function ollamaChat({ model, history, tools, maxTokens, onText }) {
+// True for the failures that come from the runner dying rather than from a bad
+// request: retrying those is worth it, retrying a malformed request is not.
+function isTransient(err) {
+  const m = String(err && err.message || err);
+  return /forcibly closed|ECONNRESET|socket hang up|EPIPE|fetch failed|terminated|500/i.test(m);
+}
+
+async function ollamaChat(opts) {
+  let lastErr;
+  for (let attempt = 0; attempt <= OLLAMA_RETRIES; attempt++) {
+    try {
+      return await ollamaChatOnce(opts);
+    } catch (e) {
+      lastErr = e;
+      if (attempt === OLLAMA_RETRIES || !isTransient(e)) break;
+      // Give Ollama a moment to reload the model it just lost.
+      const wait = 2000 * (attempt + 1);
+      console.warn(`[ollama] ${e.message.slice(0, 120)} — retrying in ${wait / 1000}s (${attempt + 1}/${OLLAMA_RETRIES})`);
+      await new Promise(r => setTimeout(r, wait));
+    }
+  }
+  throw lastErr;
+}
+
+async function ollamaChatOnce({ model, history, tools, maxTokens, onText }) {
+  // What actually goes to Ollama, so a failure can be tied to a size rather than guessed at.
+  const payloadChars = JSON.stringify(history).length + JSON.stringify(tools || []).length;
+  console.log(`[send] ${history.length} msgs + ${(tools || []).length} tools = ${Math.round(payloadChars / 1024)}KB (~${Math.round(payloadChars / 4)} tokens) of ${NUM_CTX}`);
   const r = await fetch(`${OLLAMA}/api/chat`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -911,6 +943,8 @@ async function runAgentLoop(body, res) {
 
     const onText = (piece, full) => {
       if (!stream) return;
+      // A retry restarts the stream from nothing, so forget what the failed attempt sent.
+      if (full.length < emitted) { emitted = 0; gate = null; held = ''; }
       if (gate === null) {
         const t = full.trimStart();
         if (!t) return;

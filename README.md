@@ -198,6 +198,7 @@ Everything here is set in `.env` and read at startup.
 | `ARG_DESC_LIMIT` | `120` | Max characters per parameter description. |
 | `SYSTEM_LIMIT` | `8000` | Max characters of the host system prompt, keeping the opening and the closing. Without this a 7B model answers in prose instead of calling the next tool. Your `CLAUDE.md` is unaffected: Claude Code sends it inside the messages, not the system prompt. |
 | `SNAPSHOT_LIMIT` | `4000` | Max characters of a web page handed to the model. |
+| `OLLAMA_RETRIES` | `2` | Retries when the Ollama runner dies mid-request. A model that does not fit in VRAM lives partly in system RAM, and on a busy desktop it occasionally gets killed; Ollama reloads it on the next call, so the retry usually succeeds. |
 | `RESULT_LIMIT` | `6000` | Max characters kept from a single tool result. A directory listing or a page of logs is mostly noise by the next turn. |
 | `TOOL_PRIORITY` | *(empty)* | Comma-separated fragments of tool names to keep ahead of everything else, e.g. `ollos,playwright`. |
 | `TOOL_BUDGET` | `0.35` | Share of `NUM_CTX` the tool schemas may take. Past it, tools are dropped — MCP ones first, the model's own file and shell tools last. Without this the VS Code extension's 334 tools (~69k tokens) kill the runner, and the chat shows a dropped connection rather than anything about context. |

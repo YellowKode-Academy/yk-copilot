@@ -200,6 +200,7 @@ Tudo aqui fica no `.env` e é lido na inicialização.
 | `ARG_DESC_LIMIT` | `120` | Máximo de caracteres por descrição de parâmetro. |
 | `SYSTEM_LIMIT` | `8000` | Máximo de caracteres do system prompt do host, mantendo o começo e o fim. Sem isso, um modelo 7B responde em prosa em vez de chamar a próxima ferramenta. Seu `CLAUDE.md` não é afetado: o Claude Code manda ele dentro das mensagens, não no system prompt. |
 | `SNAPSHOT_LIMIT` | `4000` | Máximo de caracteres de uma página web entregue ao modelo. |
+| `OLLAMA_RETRIES` | `2` | Tentativas quando o runner do Ollama morre no meio da requisição. Um modelo que não cabe na VRAM vive em parte na RAM do sistema, e num desktop cheio ele às vezes é morto; o Ollama recarrega na chamada seguinte, então a nova tentativa costuma passar. |
 | `RESULT_LIMIT` | `6000` | Máximo de caracteres guardados de um resultado de ferramenta. Uma listagem de diretório ou uma página de log já é ruído no turno seguinte. |
 | `TOOL_PRIORITY` | *(vazio)* | Fragmentos de nomes de ferramenta, separados por vírgula, que ficam na frente de tudo, ex.: `ollos,playwright`. |
 | `TOOL_BUDGET` | `0.35` | Fatia do `NUM_CTX` que os schemas de ferramenta podem ocupar. Passando disso, ferramentas são descartadas — as de MCP primeiro, as de arquivo e shell do modelo por último. Sem isso, as 334 ferramentas da extensão do VS Code (~69k tokens) matam o runner, e o chat mostra uma conexão derrubada em vez de qualquer coisa sobre contexto. |
