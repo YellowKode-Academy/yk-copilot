@@ -43,6 +43,12 @@ const SNAPSHOT_LIMIT = Number(process.env.SNAPSHOT_LIMIT || 4000);
 // turns trying to search the web for one. Set BROWSER_TOOLS=1 to offer them anyway,
 // which is worth doing when something other than Claude Code calls this API.
 const BROWSER_TOOLS_ENABLED = process.env.BROWSER_TOOLS === '1';
+// Ceiling on what the tool schemas may take of the context, as a fraction of NUM_CTX.
+// The VS Code extension loads every MCP server on the account without asking: measured
+// here, 334 tools and ~69,000 tokens of schema against a 24,576-token window. That
+// does not surface as a context error — the runner dies and the chat reports a
+// dropped connection, which looks like a broken install.
+const TOOL_BUDGET = Number(process.env.TOOL_BUDGET || 0.35);
 
 // ─── Playwright MCP client ────────────────────────────────────────────────────
 
@@ -461,6 +467,30 @@ function toOllamaTools(tools) {
   }));
 }
 
+// When the schemas cannot fit, drop tools rather than let the request fail. The
+// model's own file and shell tools are what make it able to code at all, so those go
+// in first and MCP tools fill whatever room is left. Losing an MCP tool costs a
+// capability; losing Edit costs everything.
+function fitToolBudget(tools) {
+  const budget = Math.floor(NUM_CTX * TOOL_BUDGET) * 4;   // ~4 chars per token
+  const size = (t) => JSON.stringify(t).length;
+  const total = tools.reduce((n, t) => n + size(t), 0);
+  if (total <= budget) return { tools, dropped: 0, total };
+
+  const core = tools.filter(t => !t.function.name.startsWith('mcp__'));
+  const mcp  = tools.filter(t =>  t.function.name.startsWith('mcp__'));
+
+  const kept = [];
+  let used = 0;
+  for (const t of [...core, ...mcp]) {
+    const n = size(t);
+    if (used + n > budget && kept.length) continue;
+    kept.push(t);
+    used += n;
+  }
+  return { tools: kept, dropped: tools.length - kept.length, total: used };
+}
+
 // Small models frequently narrate a tool call as text instead of using the native
 // tool_calls field. qwen2.5-coder never uses the native field at all. So the text has
 // to be mined for calls, tolerating <tool_call> tags, code fences, JSON embedded in
@@ -689,14 +719,19 @@ async function runAgentLoop(body, res) {
   // ── Step 2: Select code model and build history ────────────
   const model       = selectModel(cleanBody);
   const claudeTools = toOllamaTools(cleanBody.tools);
-  const allTools    = BROWSER_TOOLS_ENABLED ? [...claudeTools, ...BROWSER_TOOLS] : claudeTools;
+  const offered     = BROWSER_TOOLS_ENABLED ? [...claudeTools, ...BROWSER_TOOLS] : claudeTools;
+  const budgeted    = fitToolBudget(offered);
+  const allTools    = budgeted.tools;
+  if (budgeted.dropped) {
+    console.warn(`[tools] ${offered.length} tools exceeded the context budget; kept ${allTools.length}, dropped ${budgeted.dropped} (MCP first). Raise NUM_CTX or attach fewer MCP servers.`);
+  }
   const knownNames  = new Set(allTools.map(t => t.function.name));
   const history     = toOllamaMessages(cleanBody, allTools);
 
   if (claudeTools.length) {
     const before = JSON.stringify(cleanBody.tools).length;
-    const after  = JSON.stringify(claudeTools).length;
-    console.log(`[tools] ${claudeTools.length} tools, schema ${Math.round(before / 1024)}KB -> ${Math.round(after / 1024)}KB (~${Math.round(after / 4)} tokens)`);
+    const after  = JSON.stringify(allTools).length;
+    console.log(`[tools] ${cleanBody.tools.length} offered -> ${allTools.length} sent, schema ${Math.round(before / 1024)}KB -> ${Math.round(after / 1024)}KB (~${Math.round(after / 4)} tokens)`);
   }
 
   const visionInject = visionDescription

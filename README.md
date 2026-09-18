@@ -175,6 +175,7 @@ Everything here is set in `.env` and read at startup.
 | `ARG_DESC_LIMIT` | `120` | Max characters per parameter description. |
 | `SYSTEM_LIMIT` | `8000` | Max characters of the host system prompt, keeping the opening and the closing. Without this a 7B model answers in prose instead of calling the next tool. |
 | `SNAPSHOT_LIMIT` | `4000` | Max characters of a web page handed to the model. |
+| `TOOL_BUDGET` | `0.35` | Share of `NUM_CTX` the tool schemas may take. Past it, tools are dropped — MCP ones first, the model's own file and shell tools last. Without this the VS Code extension's 334 tools (~69k tokens) kill the runner, and the chat shows a dropped connection rather than anything about context. |
 | `BROWSER_TOOLS` | `0` | Offer the proxy's own Playwright search tools. Off because Claude Code has its own, and offering both made the model spend six turns searching the web for a `flatten` function. Set to `1` when something other than Claude Code calls this API. |
 | `MODEL_FAST` | `qwen2.5:7b` | Short requests with no tools. |
 | `MODEL_SMART` | `qwen2.5:7b` | Everything Claude Code sends. |
