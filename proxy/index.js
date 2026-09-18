@@ -902,6 +902,7 @@ async function runAgentLoop(body, res) {
 
   const openText  = () => {
     if (textOpen) return;
+    emittedAnything = true;
     sse(res, 'content_block_start', { type: 'content_block_start', index: blockIndex, content_block: { type: 'text', text: '' } });
     textOpen = true;
   };
@@ -916,7 +917,14 @@ async function runAgentLoop(body, res) {
     blockIndex++;
     textOpen = false;
   };
+  let emittedAnything = false;
   const finish = (stopReason) => {
+    // A message with no content block at all is rejected by the client as malformed,
+    // and an empty completion is exactly when that happens.
+    if (!emittedAnything) {
+      sse(res, 'content_block_start', { type: 'content_block_start', index: blockIndex, content_block: { type: 'text', text: '' } });
+      sse(res, 'content_block_stop', { type: 'content_block_stop', index: blockIndex });
+    }
     sse(res, 'message_delta', { type: 'message_delta', delta: { stop_reason: stopReason }, usage: { output_tokens: totalOutput } });
     sse(res, 'message_stop', { type: 'message_stop' });
     res.end();
@@ -1002,6 +1010,7 @@ async function runAgentLoop(body, res) {
     if (!browserCalls.length) {
       if (stream) {
         closeText();
+        emittedAnything = true;
         sseToolUse(res, claudeCalls, blockIndex, totalOutput);
         res.end();
       } else {
@@ -1027,6 +1036,14 @@ async function runAgentLoop(body, res) {
       } catch (e) { out = `Error: ${e.message}`; }
       totalToolCalls++;
       history.push({ role: 'tool', tool_name: tc.function.name, content: out });
+    }
+
+    // Out of turns with nothing sent: say so rather than closing on silence.
+    if (turn === 7) {
+      const msg = '\n\n[Stopped after 8 tool rounds without reaching an answer.]';
+      console.warn('[loop] hit the 8-turn ceiling without a final answer');
+      if (stream) { deltaText(msg); closeText(); finish('end_turn'); }
+      else res.json({ id: `msg_${Date.now().toString(36)}`, type: 'message', role: 'assistant', content: mergeText([...parts, { type: 'text', text: msg }]), model, stop_reason: 'end_turn', usage: { input_tokens: totalInput, output_tokens: totalOutput } });
     }
   }
 
