@@ -22,7 +22,7 @@ function yk-copilot {
   function Update-VsCode([string]$Action) {
     if (-not (Test-Path $VsSettings)) { return }
     if (-not (Get-Command node -ErrorAction SilentlyContinue)) { return }
-    node "$Dir\scriptsscode-toggle.js" $VsSettings $Action $Proxy
+    node "$Dir\scripts\vscode-toggle.js" $VsSettings $Action $Proxy
   }
 
   # Persist at User scope so new terminals and the VS Code extension pick it up too,
